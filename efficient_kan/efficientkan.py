@@ -80,6 +80,7 @@ class KANLinear(nn.Module):
         self.enable_standalone_scale_logistic = enable_standalone_scale_logistic
 
         if self.enable_logistic_basis:
+            #print("Using logistic basis branch")
             self.logistic_basis = LogisticBasis(in_features, num_basis)
             # Weight from (in_features * num_basis) -> out_features
             self.logistic_weight = nn.Parameter(torch.empty(out_features, in_features * num_basis))
@@ -171,6 +172,7 @@ class KANLinear(nn.Module):
 
         # NEW: logistic basis branch
         if self.enable_logistic_basis:
+            #print("Using logistic basis branch")
             phi = self.logistic_basis(x2d)              # (B*, in, num_basis)
             phi_flat = phi.reshape(x2d.size(0), -1)     # (B*, in*num_basis)
             logistic_out = F.linear(phi_flat, self.scaled_logistic_weight)  # (B*, out)
