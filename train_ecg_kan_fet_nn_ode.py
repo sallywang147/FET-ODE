@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score
 # pip install torchdiffeq
 from torchdiffeq import odeint
-
+from kan_diffusion import kan
 # =========================
 # Dataset (yours)
 # =========================
@@ -57,6 +57,7 @@ class LogisticBasis(nn.Module):
     def forward(self, x):  # x: (B, in_dim)
         x = x.unsqueeze(-1)  # → (B, in_dim, 1)
         return 2 / (1 + torch.exp(-self.a * (x - self.b)))  # (B, in_dim, num_basis)
+
 
 
 class FullyNonlinearKANCell(nn.Module):
@@ -231,257 +232,6 @@ def eval_acc(model, loader, device):
 def train_ecg200_neural_ode(
     train_path="/data/ECG200_TRAIN.txt",
     test_path="/data/ECG200_TEST.txt",
-    batch_size=32,
-    epochs=200,
-    lr=1e-3,
-    weight_decay=1e-4,
-    device=None,
-):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-
-    train_ds, test_ds = load_ecg200(train_path, test_path)
-    T = train_ds.X.shape[1]
-    num_classes = int(torch.max(train_ds.y).item() + 1)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
-    test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
-
-    model = ECGNeuralODEClassifier(
-        T=T,
-        num_classes=num_classes,
-        latent_dim=64,
-        conv_channels=32,
-        ode_hidden=128,
-        dropout=0.1,
-        solver="dopri5",
-        rtol=1e-3,
-        atol=1e-4,
-    ).to(device)
-
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-
-    best = 0.0
-    acc_train_list, acc_test_list = [], []
-    for ep in range(1, epochs + 1):
-        model.train()
-        running = 0.0
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(x)
-            loss = criterion(logits, y)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            running += loss.item() * y.size(0)
-
-        train_loss = running / len(train_ds)
-        acc = eval_acc(model, test_loader, device)
-        best = max(best, acc)
-        acc_test_list.append(acc)
-        acc_train_list.append(train_loss)
-        if ep % 10 == 0 or ep == 1:
-            print(f"Epoch {ep:3d} | train_loss {train_loss:.4f} | test_acc {acc*100:.2f}% | best {best*100:.2f}%")
-
-    return model, acc_train_list, acc_test_list
-
-def train_KAN_RNN(epochs):
-    train_set, test_set = load_ecg200()
-    # plot_example_signals(train_set)
-
-    train_loader = DataLoader(train_set, batch_size=4, shuffle=True)
-    test_loader = DataLoader(test_set, batch_size=4)
-
-    model = FullyNonlinearKANRNN()
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-2)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
-    acc_train_list, acc_test_list = [], []
-
-    for epoch in range(epochs):
-        model.train()
-        for X_batch, y_batch in train_loader:
-            optimizer.zero_grad()
-            logits = model(X_batch)
-            loss = criterion(logits, y_batch)
-            loss.backward()
-            optimizer.step()
-        scheduler.step()
-
-        # Evaluation
-        model.eval()
-        def evaluate(loader):
-            preds, targets = [], []
-            for X, y in loader:
-                out = model(X)
-                pred = out.argmax(dim=1)
-                preds.extend(pred.cpu().numpy())
-                targets.extend(y.cpu().numpy())
-            return accuracy_score(targets, preds)
-
-        acc_train = evaluate(train_loader)
-        acc_test = evaluate(test_loader)
-        acc_train_list.append(acc_train)
-        acc_test_list.append(acc_test)
-    return model, acc_train_list, acc_test_list
-
-
-
-
-
-class LogisticBasisConv1d(nn.Module):
-    """
-    1D version of LogisticBasisConv2d.
-
-    x: (B, Cin, L)
-    out: (B, Cout, L_out)
-    """
-    def __init__(self, in_channels, out_channels, kernel_size, num_basis=3, stride=1, padding=0):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = int(kernel_size)
-        self.num_basis = num_basis
-        self.stride = int(stride)
-        self.padding = int(padding)
-
-        k = self.kernel_size
-        # Parameters per (Cout, Cin, basis, k)
-        self.a    = nn.Parameter(torch.randn(out_channels, in_channels, num_basis, k))
-        self.b    = nn.Parameter(torch.randn(out_channels, in_channels, num_basis, k))
-        self.coef = nn.Parameter(torch.randn(out_channels, in_channels, num_basis, k))
-        self.bias = nn.Parameter(torch.zeros(out_channels))
-
-    def forward(self, x):
-        # x: (B, Cin, L)
-        B, Cin, L = x.shape
-        k = self.kernel_size
-
-        # 1) Unfold 1D using unfold on a (B, Cin, 1, L) tensor
-        #    -> (B, Cin, 1, L_out, k)
-        x2 = x.unsqueeze(2)  # (B, Cin, 1, L)
-        patches = x2.unfold(dimension=3, size=k, step=self.stride)  # (B, Cin, 1, L_out_raw, k)
-
-        # If padding > 0, pad first (because unfold doesn't support padding directly)
-        if self.padding > 0:
-            xpad = F.pad(x, (self.padding, self.padding))  # (B, Cin, L + 2p)
-            x2 = xpad.unsqueeze(2)                         # (B, Cin, 1, L + 2p)
-            patches = x2.unfold(dimension=3, size=k, step=self.stride)  # (B, Cin, 1, L_out, k)
-
-        patches = patches.squeeze(2)  # (B, Cin, L_out, k)
-        L_out = patches.shape[2]
-
-        # 2) Expand patches for basis
-        # (B, Cin, 1, L_out, k) -> (B, Cin, nb, L_out, k)
-        x_exp = patches.unsqueeze(2).expand(-1, -1, self.num_basis, -1, -1)
-
-        # 3) Prepare parameters and broadcast
-        # a,b,coef: (Cout, Cin, nb, k) -> (1, Cout, Cin, nb, 1, k)
-        a = self.a.unsqueeze(0).unsqueeze(4)      # (1, Cout, Cin, nb, 1, k)
-        b = self.b.unsqueeze(0).unsqueeze(4)
-        coef = self.coef.unsqueeze(0).unsqueeze(4)
-
-        # x_exp: (B, Cin, nb, L_out, k) -> (B, 1, Cin, nb, L_out, k)
-        x_exp = x_exp.unsqueeze(1)
-
-        # 4) Logistic basis
-        logistic_out = 2.0 / (1.0 + torch.exp(-a * (x_exp - b)))  # (B, Cout, Cin, nb, L_out, k)
-
-        # 5) Weighted sum over Cin, nb, k
-        out = (logistic_out * coef).sum(dim=(2, 3, 5))  # (B, Cout, L_out)
-
-        # 6) Bias
-        out = out + self.bias.view(1, -1, 1)
-        return out
-
-
-
-class KANFETNeuralODEClassifier(nn.Module):
-    def __init__(
-        self,
-        T,
-        num_classes=2,
-        in_channels=1,
-        conv_channels=32,
-        latent_dim=64,
-        ode_hidden=128,
-        dropout=0.1,
-        solver="dopri5",
-        rtol=1e-3,
-        atol=1e-4,
-        use_adjoint=False,
-        num_basis=3,
-    ):
-        super().__init__()
-        self.T = T
-        self.solver = solver
-        self.rtol = rtol
-        self.atol = atol
-        self.use_adjoint = use_adjoint
-
-        # --- Logistic-basis conv stem ---
-        self.stem = nn.Sequential(
-            LogisticBasisConv1d(in_channels, conv_channels, kernel_size=5, padding=2, num_basis=num_basis),
-            nn.SiLU(),
-            LogisticBasisConv1d(conv_channels, conv_channels, kernel_size=5, padding=2, num_basis=num_basis),
-            nn.SiLU(),
-            nn.AdaptiveAvgPool1d(1),  # (B, C, 1)
-        )
-
-        self.to_latent = nn.Sequential(
-            nn.Flatten(),  # (B, C)
-            nn.Linear(conv_channels, latent_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-        )
-
-        self.odefunc = ODEFunc(latent_dim, hidden=ode_hidden, dropout=dropout, use_ln=True)
-
-        self.head = nn.Sequential(
-            nn.LayerNorm(latent_dim),
-            nn.Linear(latent_dim, num_classes),
-        )
-
-    def forward(self, x):
-        # x: (B, T) -> (B, 1, T)
-        x = x.unsqueeze(1)
-        z0 = self.to_latent(self.stem(x))  # (B, D)
-
-        # integrate
-        t = torch.linspace(0.0, 1.0, 9, device=z0.device, dtype=z0.dtype)
-
-        # assumes odeint already imported from torchdiffeq or torchodeint
-        zt = odeint(
-            self.odefunc,
-            z0,
-            t,
-            method=self.solver,
-            rtol=self.rtol,
-            atol=self.atol,
-        )
-
-        zT = zt[-1]
-        return self.head(zT)
-
-# =========================
-# Train / Eval
-# =========================
-@torch.no_grad()
-def eval_acc(model, loader, device):
-    model.eval()
-    correct, total = 0, 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        logits = model(x)
-        pred = logits.argmax(dim=-1)
-        correct += (pred == y).sum().item()
-        total += y.numel()
-    return correct / max(total, 1)
-
-def train_kan_fet_neural_ode(
-    train_path="data/ECG200_TRAIN.txt",
-    test_path="data/ECG200_TEST.txt",
     batch_size=4,
     epochs=200,
     lr=1e-2,
@@ -533,13 +283,272 @@ def train_kan_fet_neural_ode(
         acc_test_list.append(acc)
         acc_train_list.append(train_loss)
         if ep % 10 == 0 or ep == 1:
-            print(f"Epoch {ep:3d} | train_loss {train_loss:.4f} | test_acc {acc*100:.2f}% | best {best*100:.2f}%")
+            print(f"Epoch {ep:3d} | train_loss {train_loss:.6f} | test_acc {acc*100:.2f}% | best {best*100:.2f}%")
 
     return model, acc_train_list, acc_test_list
 
+def train_KAN_RNN(epochs):
+    train_set, test_set = load_ecg200()
+    # plot_example_signals(train_set)
+
+    train_loader = DataLoader(train_set, batch_size=4, shuffle=True)
+    test_loader = DataLoader(test_set, batch_size=4)
+
+    model = FullyNonlinearKANRNN()
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-2)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+    acc_train_list, acc_test_list = [], []
+
+    for epoch in range(epochs):
+        model.train()
+        for X_batch, y_batch in train_loader:
+            optimizer.zero_grad()
+            logits = model(X_batch)
+            loss = criterion(logits, y_batch)
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
+
+        # Evaluation
+        model.eval()
+        def evaluate(loader):
+            preds, targets = [], []
+            for X, y in loader:
+                out = model(X)
+                pred = out.argmax(dim=1)
+                preds.extend(pred.cpu().numpy())
+                targets.extend(y.cpu().numpy())
+            return accuracy_score(targets, preds)
+
+        acc_train = evaluate(train_loader)
+        acc_test = evaluate(test_loader)
+        acc_train_list.append(acc_train)
+        acc_test_list.append(acc_test)
+    return model, acc_train_list, acc_test_list
+
+
+
+#turns each latent scalar into a small learned function
+class KANFeatureMixer(nn.Module):
+    """
+    Turn x:(B,D) -> phi_flat:(B, D*num_basis), with an extra nonlinearity.
+    """
+    def __init__(self, dim, num_basis, act=nn.Sigmoid()):
+        super().__init__()
+        self.basis = LogisticBasis(dim, num_basis)
+        self.act = act
+
+    def forward(self, x):
+        phi = self.basis(x)           # (B, D, K)
+        phi = self.act(phi)           # (B, D, K)
+        return phi.reshape(x.size(0), -1)  # (B, D*K)
+
+
+# -------------------- Neural ODE model (FullyNonlinearKANNeuralODE) --------------------
+
+class FullyNonlinearKANODEFunc(nn.Module):
+    """
+    dh/dt = f(h, t) where f is built using LogisticBasis features (KAN-like).
+    """
+    def __init__(self, latent_dim=64, num_basis=10, hidden=128):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.num_basis = num_basis
+
+        #Before computing the ODE dynamics, expand each latent dimension into a learned set of n
+        #onlinear logistic basis functions, then flatten them.
+        self.h_feat = KANFeatureMixer(latent_dim, num_basis, act=nn.Sigmoid())
+        # MLP on top of KAN features to produce dh/dt in R^{latent_dim}
+        self.net = nn.Sequential(
+            kan.KAN([latent_dim * num_basis, hidden]),
+            nn.SiLU(),
+            kan.KAN([hidden, latent_dim]),
+        )
+
+        # A small scale can help stability early on
+        self.scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, t, h):  # torchdiffeq signature: (t, state)
+        dh = self.net(self.h_feat(h))
+        return self.scale * dh
+
+
+class FullyNonlinearKANNeuralODEClassifier(nn.Module):
+    """
+    Input x: (B, T). Encode to latent h0, integrate ODE, decode final h(T) -> logits.
+    """
+    def __init__(
+        self,
+        T: int,
+        num_classes: int,
+        latent_dim: int = 64,
+        num_basis: int = 10,
+        ode_hidden: int = 128,
+        dropout: float = 0.1,
+        solver: str = "dopri5",
+        rtol: float = 1e-3,
+        atol: float = 1e-4,
+    ):
+        super().__init__()
+        self.T = T
+        self.num_classes = num_classes
+        self.latent_dim = latent_dim
+        self.solver = solver
+        self.rtol = rtol
+        self.atol = atol
+
+        # Simple encoder: time-series -> latent init
+        # (You can swap this with conv1d if you want)
+        self.encoder = nn.Sequential(
+            nn.Linear(T, 256),
+            nn.SiLU(),
+            nn.Linear(256, latent_dim),
+        )
+
+        self.odefunc = FullyNonlinearKANODEFunc(
+            latent_dim=latent_dim,
+            num_basis=num_basis,
+            hidden=ode_hidden,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+        # KAN-style classifier head (logistic basis on latent)
+        self.cls_feat = KANFeatureMixer(latent_dim, num_basis, act=nn.Sigmoid())
+        self.cls = nn.Linear(latent_dim * num_basis, num_classes)
+
+    def forward(self, x):  # x: (B, T)
+        B = x.size(0)
+        h0 = self.encoder(x)  # (B, latent_dim)
+
+        # Integrate from t=0..1; we only need final state.
+        # If you want intermediate states, set t_eval to more points.
+        t_eval = torch.tensor([0.0, 1.0], device=x.device, dtype=x.dtype)
+
+        h_traj = odeint(
+            self.odefunc,
+            h0,
+            t_eval,
+            method=self.solver,
+            rtol=self.rtol,
+            atol=self.atol,
+        )  # (2, B, latent_dim)
+
+        hT = h_traj[-1]  # (B, latent_dim)
+        hT = self.dropout(hT)
+
+        feat = self.cls_feat(hT)      # (B, latent_dim*num_basis)
+        logits = self.cls(feat)       # (B, num_classes)
+        return logits
+
+
+def train_fully_nonlinear_kan_neural_ode(
+    train_path="data/ECG200_TRAIN.txt",
+    test_path="data/ECG200_TEST.txt",
+    batch_size=4,
+    epochs=200,
+    lr=1e-2,
+    weight_decay=1e-4,
+    device=None,
+    # model hyperparams
+    latent_dim=64,
+    num_basis=10,
+    ode_hidden=128,
+    dropout=0.1,
+    solver="dopri5",
+    rtol=1e-3,
+    atol=1e-4,
+):
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    # assumes you already have:
+    #   train_ds, test_ds = load_ecg200(train_path, test_path)
+    train_ds, test_ds = load_ecg200(train_path, test_path)
+
+    T = train_ds.X.shape[1]
+    num_classes = int(torch.max(train_ds.y).item() + 1)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+    test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    model = FullyNonlinearKANNeuralODEClassifier(
+        T=T,
+        num_classes=num_classes,
+        latent_dim=latent_dim,
+        num_basis=num_basis,
+        ode_hidden=ode_hidden,
+        dropout=dropout,
+        solver=solver,
+        rtol=rtol,
+        atol=atol,
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best = 0.0
+    train_loss_list, test_acc_list = [], []
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        running = 0.0
+
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(x)
+            loss = criterion(logits, y)
+            loss.backward()
+
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            running += loss.item() * y.size(0)
+
+        train_loss = running / len(train_ds)
+        acc = eval_acc(model, test_loader, device)
+
+        best = max(best, acc)
+        train_loss_list.append(train_loss)
+        test_acc_list.append(acc)
+
+        if ep % 10 == 0 or ep == 1:
+            print(
+                f"Epoch {ep:3d} | "
+                f"train_loss {train_loss:.6f} | "
+                f"test_acc {acc*100:.2f}% | "
+                f"best {best*100:.2f}%"
+            )
+
+    return model, train_loss_list, test_acc_list
+
+
+
+
+# =========================
+# Train / Eval
+# =========================
+@torch.no_grad()
+def eval_acc(model, loader, device):
+    model.eval()
+    correct, total = 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
+        pred = logits.argmax(dim=-1)
+        correct += (pred == y).sum().item()
+        total += y.numel()
+    return correct / max(total, 1)
+
+
+
+
+
 if __name__ == "__main__":
     # Put ECG200_TRAIN.txt / ECG200_TEST.txt in the same folder or pass paths.
-    
+
     node_model, node_model_train_acc, node_model_test_acc = train_ecg200_neural_ode(
         train_path="data/ECG200_TRAIN.txt",
         test_path="data/ECG200_TEST.txt",
@@ -547,16 +556,27 @@ if __name__ == "__main__":
         epochs=200,
         lr=1e-2,
     )
-    
+
     base_knn_model, base_knn_train_acc, base_knn_test_acc = train_KAN_RNN(200)
 
-    kan_fet_ode_model, kan_fet_ode_train_acc, kan_fet_ode_test_acc = train_kan_fet_neural_ode(
-        train_path="data/ECG200_TRAIN.txt",
-        test_path="data/ECG200_TEST.txt",
-        batch_size=4,
-        epochs=200,
-        lr=1e-2,
-    )
+    kan_fet_ode_model, kan_fet_ode_train_acc, kan_fet_ode_test_acc = train_fully_nonlinear_kan_neural_ode(
+    train_path="data/ECG200_TRAIN.txt",
+    test_path="data/ECG200_TEST.txt",
+    batch_size=8,
+    epochs=200,
+    lr=5e-3,
+    weight_decay=1e-4,
+    device="cpu",
+
+    # Neural ODE / KAN knobs
+    latent_dim=64,
+    num_basis=12,
+    ode_hidden=128,
+    dropout=0.1,
+    solver="dopri5",
+    rtol=1e-3,
+    atol=1e-4,
+   )
 
 
     plt.figure(figsize=(10, 7))
@@ -576,7 +596,7 @@ if __name__ == "__main__":
     plt.xticks(fontsize=15)
     plt.yticks(fontsize=15)
 
-    plt.legend(fontsize=25)
+    plt.legend(fontsize=15)
     plt.grid(True)
 
     plt.tight_layout()
@@ -585,17 +605,17 @@ if __name__ == "__main__":
 
     plt.figure(figsize=(10, 7))
     plt.plot(kan_fet_ode_test_acc, color=KAN_FET_ODE_color, label="KAN-FET-NODE Test Acc", linewidth=3)
-    plt.plot(base_knn_test_acc, color=KAN_COLOR, label="KAN-FET-RNN Test Acc", linewidth=3)
+    plt.plot(base_knn_test_acc, color=KAN_COLOR, label="KAN-NN Test Acc", linewidth=3)
     plt.plot(node_model_test_acc, color=ODE_COLOR, label="Neural ODE (NODE) Test Acc", linewidth=3)
 
     plt.xlabel("Epoch", fontsize=20)
     plt.ylabel("Accuracy", fontsize=20)
-    plt.title("Test Accuracy", fontsize=10)
+    plt.title("Test Accuracy", fontsize=30)
 
     plt.xticks(fontsize=15)
     plt.yticks(fontsize=15)
 
-    plt.legend(fontsize=10)
+    plt.legend(fontsize=15)
     plt.grid(True)
 
     plt.tight_layout()
