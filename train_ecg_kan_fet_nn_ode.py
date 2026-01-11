@@ -35,7 +35,7 @@ def _encode_labels_consistently(y_train, y_test):
 
 def load_ecg200(path="data/ECG200_TRAIN.txt", path_test="data/ECG200_TEST.txt"):
     def load_file(p):
-        df = pd.read_csv(p, header=None, delim_whitespace=True)
+        df = pd.read_csv(p, header=None, sep='\s+')
         y = df.iloc[:, 0].values
         x = df.iloc[:, 1:].values
         x = (x - x.mean(axis=1, keepdims=True)) / (x.std(axis=1, keepdims=True) + 1e-8)
@@ -125,13 +125,13 @@ class ODEFunc(nn.Module):
         self.use_ln = use_ln
         self.ln = nn.LayerNorm(dim) if use_ln else nn.Identity()
         self.net = nn.Sequential(
-            nn.Linear(dim, hidden),
+            kan.KAN([dim, hidden]),
             nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
+            kan.KAN([hidden, hidden]),
             nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden, dim),
+            kan.KAN([hidden, dim]),
         )
         # Small init helps stability
         for m in self.net:
@@ -143,33 +143,25 @@ class ODEFunc(nn.Module):
         z = self.ln(z)
         return self.net(z)
 
-class ECGNeuralODEClassifier(nn.Module):
-    """
-    Input: x (B, T)
-    1) Conv stem: (B, T) -> (B, C, T) -> pooled -> z0 (B, D)
-    2) ODE evolve z(t) over fixed time grid
-    3) Classify from final z(T)
-    """
+
+class KAN_NODE(nn.Module):
     def __init__(
         self,
         T,
         num_classes=2,
         in_channels=1,
         conv_channels=32,
-        latent_dim=64,
         ode_hidden=128,
         dropout=0.1,
-        solver="dopri5",
+        solver="dpori5",
         rtol=1e-3,
         atol=1e-4,
-        use_adjoint=False,  # keep False unless you need memory savings
     ):
         super().__init__()
         self.T = T
         self.solver = solver
         self.rtol = rtol
         self.atol = atol
-        self.use_adjoint = use_adjoint
 
         self.stem = nn.Sequential(
             nn.Conv1d(in_channels, conv_channels, kernel_size=5, padding=2),
@@ -178,27 +170,24 @@ class ECGNeuralODEClassifier(nn.Module):
             nn.SiLU(),
             nn.AdaptiveAvgPool1d(1),  # (B, C, 1)
         )
-        self.to_latent = nn.Sequential(
-            nn.Flatten(),                    # (B, C)
-            nn.Linear(conv_channels, latent_dim),
-            nn.SiLU(),
+
+        # ✅ no latent projection: state is just pooled conv features (B, C)
+        self.to_state = nn.Sequential(
+            nn.Flatten(),          # (B, C)
             nn.Dropout(dropout),
         )
 
-        self.odefunc = ODEFunc(latent_dim, hidden=ode_hidden, dropout=dropout, use_ln=True)
+        self.odefunc = ODEFunc(conv_channels, hidden=ode_hidden, dropout=dropout, use_ln=True)
 
         self.head = nn.Sequential(
-            nn.LayerNorm(latent_dim),
-            nn.Linear(latent_dim, num_classes),
+            nn.LayerNorm(conv_channels),
+            nn.Linear(conv_channels, num_classes),
         )
 
     def forward(self, x):
-        # x: (B, T) -> (B, 1, T)
-        x = x.unsqueeze(1)
-        z0 = self.to_latent(self.stem(x))  # (B, D)
+        x = x.unsqueeze(1)                  # (B,1,T)
+        z0 = self.to_state(self.stem(x))    # (B,C)
 
-        # Integrate from t=0..1 with a small number of evaluation points.
-        # More points can help, but is slower.
         t = torch.linspace(0.0, 1.0, 9, device=z0.device, dtype=z0.dtype)
 
         zt = odeint(
@@ -206,13 +195,9 @@ class ECGNeuralODEClassifier(nn.Module):
             z0,
             t,
             method=self.solver,
-            rtol=self.rtol,
-            atol=self.atol,
-        )  # (len(t), B, D)
-
-        zT = zt[-1]  # final state (B, D)
-        logits = self.head(zT)
-        return logits
+        )
+        zT = zt[-1]
+        return self.head(zT)
 
 # =========================
 # Train / Eval
@@ -229,11 +214,11 @@ def eval_acc(model, loader, device):
         total += y.numel()
     return correct / max(total, 1)
 
-def train_ecg200_neural_ode(
+def train_KAN_NODE(
     train_path="/data/ECG200_TRAIN.txt",
     test_path="/data/ECG200_TEST.txt",
     batch_size=4,
-    epochs=200,
+    epochs=100,
     lr=1e-2,
     weight_decay=1e-4,
     device=None,
@@ -247,14 +232,13 @@ def train_ecg200_neural_ode(
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
     test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
 
-    model = ECGNeuralODEClassifier(
+    model = KAN_NODE(
         T=T,
         num_classes=num_classes,
-        latent_dim=64,
         conv_channels=32,
         ode_hidden=128,
         dropout=0.1,
-        solver="dopri5",
+        solver="rk4",
         rtol=1e-3,
         atol=1e-4,
     ).to(device)
@@ -345,9 +329,67 @@ class KANFeatureMixer(nn.Module):
         return phi.reshape(x.size(0), -1)  # (B, D*K)
 
 
-# -------------------- Neural ODE model (FullyNonlinearKANNeuralODE) --------------------
+class MLPKANODEFunc(nn.Module):
+    """
+    dh/dt = f(h, t) with KANFeatureMixer + KAN blocks, stabilized WITHOUT modifying LogisticBasis.
+    """
+    def __init__(self, latent_dim=64, num_basis=10, hidden=128,
+                 h_bound=1.0, dh_clip=10.0, init_out_std=1e-3):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.num_basis = num_basis
+        self.h_bound = h_bound
+        self.dh_clip = dh_clip
 
-class FullyNonlinearKANODEFunc(nn.Module):
+        # normalize + bound state before basis to avoid exp overflow in logistic basis
+        self.ln = nn.LayerNorm(latent_dim)
+
+        self.h_feat = KANFeatureMixer(latent_dim, num_basis, act=nn.Sigmoid())  # (B, D*K)
+
+        # KAN blocks (may not have bias/weight exposed)
+        self.kan1 = kan.KAN([latent_dim * num_basis, hidden])
+        self.act  = nn.SiLU()
+        self.kan2 = kan.KAN([hidden, hidden])
+
+        # final projection with standard Linear so we can init small + has bias
+        self.out = nn.Linear(hidden, latent_dim, bias=True)
+
+        # small init on final linear => small dh/dt at start
+        nn.init.zeros_(self.out.bias)
+        nn.init.normal_(self.out.weight, mean=0.0, std=init_out_std)
+
+        # Learnable scale on vector field (starts small)
+        self.log_alpha = nn.Parameter(torch.tensor(-3.0))  # alpha ≈ softplus(-3) ≈ 0.05
+
+        # Optional additional global scale (keep if you want)
+        self.scale = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, t, h):
+        # 1) normalize + bound h (no LogisticBasis modification needed)
+        h = self.ln(h)
+        h = self.h_bound * torch.tanh(h / self.h_bound)  # bounds values into ~[-h_bound, h_bound]
+
+        # 2) basis features
+        phi = self.h_feat(h)  # (B, D*K)
+
+        phi = torch.nan_to_num(phi, nan=0.0, posinf=1e3, neginf=-1e3)
+
+        # 3) KAN-based transformation
+        z = self.kan1(phi)
+        z = self.act(z)
+        z = self.kan2(z)
+        z = self.act(z)
+
+        # 4) output derivative in R^{latent_dim} with a controlled linear head
+        dh = self.out(z)
+
+        # 5) scale + clamp
+        alpha = F.softplus(self.log_alpha)
+        dh = self.scale * alpha * dh
+
+        return dh
+
+class No_MLP_KANODEFunc(nn.Module):
     """
     dh/dt = f(h, t) where f is built using LogisticBasis features (KAN-like).
     """
@@ -358,23 +400,25 @@ class FullyNonlinearKANODEFunc(nn.Module):
 
         #Before computing the ODE dynamics, expand each latent dimension into a learned set of n
         #onlinear logistic basis functions, then flatten them.
-        self.h_feat = KANFeatureMixer(latent_dim, num_basis, act=nn.Sigmoid())
+        self.feat = KANFeatureMixer(latent_dim, num_basis, act=nn.Sigmoid())
         # MLP on top of KAN features to produce dh/dt in R^{latent_dim}
-        self.net = nn.Sequential(
-            kan.KAN([latent_dim * num_basis, hidden]),
-            nn.SiLU(),
-            kan.KAN([hidden, latent_dim]),
-        )
-
         # A small scale can help stability early on
-        self.scale = nn.Parameter(torch.tensor(0.1))
+        self.proj = nn.Linear(latent_dim * num_basis, latent_dim)
 
-    def forward(self, t, h):  # torchdiffeq signature: (t, state)
-        dh = self.net(self.h_feat(h))
-        return self.scale * dh
+        # Optional: small init helps stability
+        nn.init.zeros_(self.proj.bias)
+        nn.init.normal_(self.proj.weight, mean=0.0, std=0.01)
 
+    def forward(self, t, h):
+        phi = self.feat(h)          # (B, D*K)
+        dh = self.proj(phi)         # (B, D)
+        # safety
+        assert dh.shape == h.shape, (dh.shape, h.shape)
+        return dh
+    
+# -------------------- KanFet NODE -----------------------
 
-class FullyNonlinearKANNeuralODEClassifier(nn.Module):
+class KanFet_NODE(nn.Module):
     """
     Input x: (B, T). Encode to latent h0, integrate ODE, decode final h(T) -> logits.
     """
@@ -400,18 +444,13 @@ class FullyNonlinearKANNeuralODEClassifier(nn.Module):
 
         # Simple encoder: time-series -> latent init
         # (You can swap this with conv1d if you want)
-        self.encoder = nn.Sequential(
-            nn.Linear(T, 256),
-            nn.SiLU(),
-            nn.Linear(256, latent_dim),
-        )
+        self.encoder = nn.Linear(T, latent_dim)
 
-        self.odefunc = FullyNonlinearKANODEFunc(
+        self.odefunc = No_MLP_KANODEFunc(
             latent_dim=latent_dim,
             num_basis=num_basis,
             hidden=ode_hidden,
         )
-
         self.dropout = nn.Dropout(dropout)
 
         # KAN-style classifier head (logistic basis on latent)
@@ -425,7 +464,6 @@ class FullyNonlinearKANNeuralODEClassifier(nn.Module):
         # Integrate from t=0..1; we only need final state.
         # If you want intermediate states, set t_eval to more points.
         t_eval = torch.tensor([0.0, 1.0], device=x.device, dtype=x.dtype)
-
         h_traj = odeint(
             self.odefunc,
             h0,
@@ -443,7 +481,7 @@ class FullyNonlinearKANNeuralODEClassifier(nn.Module):
         return logits
 
 
-def train_fully_nonlinear_kan_neural_ode(
+def train_kan_fet_node(
     train_path="data/ECG200_TRAIN.txt",
     test_path="data/ECG200_TEST.txt",
     batch_size=4,
@@ -452,7 +490,7 @@ def train_fully_nonlinear_kan_neural_ode(
     weight_decay=1e-4,
     device=None,
     # model hyperparams
-    latent_dim=64,
+    latent_dim=1,
     num_basis=10,
     ode_hidden=128,
     dropout=0.1,
@@ -472,7 +510,7 @@ def train_fully_nonlinear_kan_neural_ode(
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
     test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
 
-    model = FullyNonlinearKANNeuralODEClassifier(
+    model = KanFet_NODE(
         T=T,
         num_classes=num_classes,
         latent_dim=latent_dim,
@@ -525,7 +563,471 @@ def train_fully_nonlinear_kan_neural_ode(
     return model, train_loss_list, test_acc_list
 
 
+# -------------------- KanFet MLP -----------------------
+def integrate_euler(odefunc, h0, t0=0.0, t1=1.0, n_steps=8):
+    """Fixed-step explicit Euler. Returns hT."""
+    h = h0
+    dt = (t1 - t0) / n_steps
+    t = torch.as_tensor(t0, device=h0.device, dtype=h0.dtype)
+    for _ in range(n_steps):
+        dh = odefunc(t, h)
+        h = h + dt * dh
+        t = t + dt
+    return h
 
+def integrate_rk2(odefunc, h0, t0=0.0, t1=1.0, n_steps=8):
+    """Fixed-step RK2 (midpoint). Returns hT."""
+    h = h0
+    dt = (t1 - t0) / n_steps
+    t = torch.as_tensor(t0, device=h0.device, dtype=h0.dtype)
+    for _ in range(n_steps):
+        k1 = odefunc(t, h)
+        k2 = odefunc(t + 0.5 * dt, h + 0.5 * dt * k1)
+        h = h + dt * k2
+        t = t + dt
+    return h
+
+def integrate_rk4(odefunc, h0, t0=0.0, t1=1.0, n_steps=8):
+    """Fixed-step RK4. Returns hT."""
+    h = h0
+    dt = (t1 - t0) / n_steps
+    t = torch.as_tensor(t0, device=h0.device, dtype=h0.dtype)
+    for _ in range(n_steps):
+        k1 = odefunc(t, h)
+        k2 = odefunc(t + 0.5 * dt, h + 0.5 * dt * k1)
+        k3 = odefunc(t + 0.5 * dt, h + 0.5 * dt * k2)
+        k4 = odefunc(t + dt,       h + dt * k3)
+        h = h + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        t = t + dt
+    return h
+
+class KanFet_MLP_Euler_Rollout(nn.Module):
+    """
+    Same as your model, but replaces odeint with fixed-step rollout.
+    """
+    def __init__(
+        self,
+        T: int,
+        num_classes: int,
+        latent_dim: int = 64,
+        num_basis: int = 10,
+        ode_hidden: int = 128,
+        dropout: float = 0.1,
+        integrator: str = "euler",   # "euler" | "rk2" | "rk4"
+        n_steps: int = 8,          # fixed number of steps from 0..1
+    ):
+        super().__init__()
+        self.T = T
+        self.num_classes = num_classes
+        self.latent_dim = latent_dim
+        self.integrator = integrator
+        self.n_steps = n_steps
+
+        self.encoder = nn.Linear(T, latent_dim)
+
+        self.odefunc = MLPKANODEFunc(
+            latent_dim=latent_dim,
+            num_basis=num_basis,
+            hidden=ode_hidden,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+        self.cls_feat = KANFeatureMixer(latent_dim, num_basis, act=nn.Sigmoid())
+        self.cls = nn.Linear(latent_dim * num_basis, num_classes)
+
+    def _integrate(self, h0):
+        if self.integrator == "euler":
+            return integrate_euler(self.odefunc, h0, 0.0, 1.0, self.n_steps)
+        elif self.integrator == "rk2":
+            return integrate_rk2(self.odefunc, h0, 0.0, 1.0, self.n_steps)
+        elif self.integrator == "rk4":
+            return integrate_rk4(self.odefunc, h0, 0.0, 1.0, self.n_steps)
+        else:
+            raise ValueError(f"Unknown integrator: {self.integrator}")
+
+    def forward(self, x):  # x: (B, T)
+        h0 = self.encoder(x)     # (B, latent_dim)
+        hT = self._integrate(h0) # (B, latent_dim)
+        hT = self.dropout(hT)
+
+        feat = self.cls_feat(hT)
+        logits = self.cls(feat)
+        return logits
+
+
+def train_kan_fet_mlp(
+    train_path="data/ECG200_TRAIN.txt",
+    test_path="data/ECG200_TEST.txt",
+    batch_size=4,
+    epochs=200,
+    lr=1e-2,
+    weight_decay=1e-4,
+    device=None,
+    latent_dim=64,
+    num_basis=10,
+    ode_hidden=128,
+    dropout=0.1,
+    integrator="euler",
+    n_steps=8,
+):
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    train_ds, test_ds = load_ecg200(train_path, test_path)
+    T = train_ds.X.shape[1]
+    num_classes = int(torch.max(train_ds.y).item() + 1)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+    test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    model = KanFet_MLP_Euler_Rollout(
+        T=T,
+        num_classes=num_classes,
+        latent_dim=latent_dim,
+        num_basis=num_basis,
+        ode_hidden=ode_hidden,
+        dropout=dropout,
+        integrator=integrator,
+        n_steps=n_steps,
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best = 0.0
+    train_loss_list, test_acc_list = [], []
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        running = 0.0
+
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(x)
+            loss = criterion(logits, y)
+            loss.backward()
+
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            running += loss.item() * y.size(0)
+
+        train_loss = running / len(train_ds)
+        acc = eval_acc(model, test_loader, device)
+
+        best = max(best, acc)
+        train_loss_list.append(train_loss)
+        test_acc_list.append(acc)
+
+        if ep % 10 == 0 or ep == 1:
+            print(
+                f"Epoch {ep:3d} | "
+                f"train_loss {train_loss:.6f} | "
+                f"test_acc {acc*100:.2f}% | "
+                f"best {best*100:.2f}%"
+            )
+
+    return model, train_loss_list, test_acc_list
+
+# -------------------- KanFet MLP NODE No Latent Embedding --------------------
+
+class KanFet_MLP_NODE_NOLatentEmbeddings(nn.Module):
+    """
+    Input x: (B, T). Encode to latent h0, integrate ODE, decode final h(T) -> logits.
+    """
+    def __init__(
+        self,
+        T: int,
+        num_classes: int,
+        latent_dim: int = 64,
+        num_basis: int = 10,
+        ode_hidden: int = 128,
+        dropout: float = 0.1,
+        solver: str = "rk4",
+        rtol: float = 1e-3,
+        atol: float = 1e-4,
+    ):
+        super().__init__()
+        self.T = T
+        self.num_classes = num_classes
+        self.latent_dim = latent_dim
+        self.solver = solver
+        self.rtol = rtol
+        self.atol = atol
+
+        # Simple encoder: time-series -> latent init
+        # (You can swap this with conv1d if you want)
+        self.encoder = nn.Linear(T, latent_dim)
+   
+
+        self.odefunc =  MLPKANODEFunc(
+            latent_dim=latent_dim,
+            num_basis=num_basis,
+            hidden=ode_hidden,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+        # KAN-style classifier head (logistic basis on latent)
+        self.cls_feat = KANFeatureMixer(latent_dim, num_basis, act=nn.Sigmoid())
+        self.cls = nn.Linear(latent_dim * num_basis, num_classes)
+
+    def forward(self, x):  # x: (B, T)
+        B = x.size(0)
+        h0 = self.encoder(x)  # (B, latent_dim)
+
+        # Integrate from t=0..1; we only need final state.
+        # If you want intermediate states, set t_eval to more points.
+        t_eval = torch.tensor([0.0, 1.0], device=x.device, dtype=x.dtype)
+
+        h_traj = odeint(
+            self.odefunc,
+            h0,
+            t_eval,
+            method=self.solver,
+        )  # (2, B, latent_dim)
+
+        hT = h_traj[-1]  # (B, latent_dim)
+        hT = self.dropout(hT)
+
+        feat = self.cls_feat(hT)      # (B, latent_dim*num_basis)
+        logits = self.cls(feat)       # (B, num_classes)
+        return logits
+
+
+
+def train_kan_fet_mlp_node_nolatentembeddings(
+    train_path="data/ECG200_TRAIN.txt",
+    test_path="data/ECG200_TEST.txt",
+    batch_size=4,
+    epochs=200,
+    lr=1e-2,
+    weight_decay=1e-4,
+    device=None,
+    # model hyperparams
+    latent_dim=64,
+    num_basis=10,
+    ode_hidden=128,
+    dropout=0.1,
+    solver="rk4",
+    rtol=1e-3,
+    atol=1e-4,
+):
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    # assumes you already have:
+    #   train_ds, test_ds = load_ecg200(train_path, test_path)
+    train_ds, test_ds = load_ecg200(train_path, test_path)
+
+    T = train_ds.X.shape[1]
+    num_classes = int(torch.max(train_ds.y).item() + 1)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+    test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    model = KanFet_MLP_NODE_NOLatentEmbeddings(
+        T=T,
+        num_classes=num_classes,
+        latent_dim=latent_dim,
+        num_basis=num_basis,
+        ode_hidden=ode_hidden,
+        dropout=dropout,
+        solver=solver,
+        rtol=rtol,
+        atol=atol,
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best = 0.0
+    train_loss_list, test_acc_list = [], []
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        running = 0.0
+
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(x)
+            loss = criterion(logits, y)
+            loss.backward()
+
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            running += loss.item() * y.size(0)
+
+        train_loss = running / len(train_ds)
+        acc = eval_acc(model, test_loader, device)
+
+        best = max(best, acc)
+        train_loss_list.append(train_loss)
+        test_acc_list.append(acc)
+
+        if ep % 10 == 0 or ep == 1:
+            print(
+                f"Epoch {ep:3d} | "
+                f"train_loss {train_loss:.6f} | "
+                f"test_acc {acc*100:.2f}% | "
+                f"best {best*100:.2f}%"
+            )
+
+    return model, train_loss_list, test_acc_list
+
+
+# -------------------- KanFet MLP NODE Latent Space Embedded --------------------
+
+
+class KanFet_MLP_NODE(nn.Module):
+    """
+    Input x: (B, T). Encode to latent h0, integrate ODE, decode final h(T) -> logits.
+    """
+    def __init__(
+        self,
+        T: int,
+        num_classes: int,
+        latent_dim: int = 64,
+        num_basis: int = 10,
+        ode_hidden: int = 128,
+        dropout: float = 0.1,
+        solver: str = "dopri5",
+        rtol: float = 1e-3,
+        atol: float = 1e-4,
+    ):
+        super().__init__()
+        self.T = T
+        self.num_classes = num_classes
+        self.latent_dim = latent_dim
+        self.solver = solver
+        self.rtol = rtol
+        self.atol = atol
+
+        # Simple encoder: time-series -> latent init
+        # (You can swap this with conv1d if you want)
+        self.encoder = nn.Linear(T, latent_dim)
+
+
+        self.odefunc =  MLPKANODEFunc(
+            latent_dim=latent_dim,
+            num_basis=num_basis,
+            hidden=ode_hidden,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+        # KAN-style classifier head (logistic basis on latent)
+        self.cls_feat = KANFeatureMixer(latent_dim, num_basis, act=nn.Sigmoid())
+        self.cls = nn.Linear(latent_dim * num_basis, num_classes)
+
+    def forward(self, x):  # x: (B, T)
+        B = x.size(0)
+        h0 = self.encoder(x)  # (B, latent_dim)
+
+        # Integrate from t=0..1; we only need final state.
+        # If you want intermediate states, set t_eval to more points.
+        #t_eval = torch.tensor([0.0, 1.0], device=x.device, dtype=x.dtype)
+        t_eval = torch.linspace(0.0, 1.0, 9, device=x.device, dtype=torch.float64)
+        h_traj = odeint(
+            self.odefunc,
+            h0,
+            t_eval,
+            method="dopri5",
+            rtol=self.rtol,
+            atol=self.atol,
+        )  # (2, B, latent_dim)
+
+        hT = h_traj[-1]  # (B, latent_dim)
+        hT = self.dropout(hT)
+
+        feat = self.cls_feat(hT)      # (B, latent_dim*num_basis)
+        logits = self.cls(feat)       # (B, num_classes)
+        return logits
+
+
+def train_kan_fet_mlp_node(
+    train_path="data/ECG200_TRAIN.txt",
+    test_path="data/ECG200_TEST.txt",
+    batch_size=4,
+    epochs=200,
+    lr=1e-2,
+    weight_decay=1e-4,
+    device=None,
+    # model hyperparams
+    latent_dim=64,
+    num_basis=10,
+    ode_hidden=128,
+    dropout=0.1,
+    solver="dopri5",
+    rtol=1e-3,
+    atol=1e-4,
+):
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    # assumes you already have:
+    #   train_ds, test_ds = load_ecg200(train_path, test_path)
+    train_ds, test_ds = load_ecg200(train_path, test_path)
+
+    T = train_ds.X.shape[1]
+    num_classes = int(torch.max(train_ds.y).item() + 1)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+    test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    model = KanFet_MLP_NODE(
+        T=T,
+        num_classes=num_classes,
+        latent_dim=latent_dim,
+        num_basis=num_basis,
+        ode_hidden=ode_hidden,
+        dropout=dropout,
+        solver=solver,
+        rtol=rtol,
+        atol=atol,
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best = 0.0
+    train_loss_list, test_acc_list = [], []
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        running = 0.0
+
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(x)
+            loss = criterion(logits, y)
+            loss.backward()
+
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            running += loss.item() * y.size(0)
+
+        train_loss = running / len(train_ds)
+        acc = eval_acc(model, test_loader, device)
+
+        best = max(best, acc)
+        train_loss_list.append(train_loss)
+        test_acc_list.append(acc)
+
+        if ep % 10 == 0 or ep == 1:
+            print(
+                f"Epoch {ep:3d} | "
+                f"train_loss {train_loss:.6f} | "
+                f"test_acc {acc*100:.2f}% | "
+                f"best {best*100:.2f}%"
+            )
+
+    return model, train_loss_list, test_acc_list
 
 # =========================
 # Train / Eval
@@ -549,21 +1051,86 @@ def eval_acc(model, loader, device):
 if __name__ == "__main__":
     # Put ECG200_TRAIN.txt / ECG200_TEST.txt in the same folder or pass paths.
 
-    node_model, node_model_train_acc, node_model_test_acc = train_ecg200_neural_ode(
+    EPOCHS = 100
+
+    print("Training KAN-NODE...")
+
+    node_model, node_model_train_acc, node_model_test_acc = train_KAN_NODE(
         train_path="data/ECG200_TRAIN.txt",
         test_path="data/ECG200_TEST.txt",
         batch_size=4,
-        epochs=200,
+        epochs=EPOCHS,
         lr=1e-2,
     )
+    print("Training KanFet-RNN...")
+    base_knn_model, base_knn_train_acc, base_knn_test_acc = train_KAN_RNN(EPOCHS)
 
-    base_knn_model, base_knn_train_acc, base_knn_test_acc = train_KAN_RNN(200)
-
-    kan_fet_ode_model, kan_fet_ode_train_acc, kan_fet_ode_test_acc = train_fully_nonlinear_kan_neural_ode(
+    print("Training KanFet-NODE...")
+    kan_fet_ode_model, kan_fet_ode_train_acc, kan_fet_ode_test_acc = train_kan_fet_node(
     train_path="data/ECG200_TRAIN.txt",
     test_path="data/ECG200_TEST.txt",
     batch_size=8,
-    epochs=200,
+    epochs=EPOCHS,
+    lr=5e-3,
+    weight_decay=1e-4,
+    device="cpu",
+
+    # Neural ODE / KAN knobs
+    latent_dim=1,
+    num_basis=12,
+    ode_hidden=128,
+    dropout=0.1,
+    solver="dopri5",
+    rtol=1e-2,
+    atol=1e-3,
+   )
+
+
+    print("Training KanFet-MLP...")
+    kan_fet_mlp_model, kan_fet_mlp_train_acc, kan_fet_mlp_test_acc = train_kan_fet_mlp (
+    train_path="data/ECG200_TRAIN.txt",
+    test_path="data/ECG200_TEST.txt",
+    batch_size=8,
+    epochs=EPOCHS,
+    lr=5e-3,
+    weight_decay=1e-4,
+    device="cpu",
+
+    # Neural ODE / KAN knobs
+    latent_dim=1,
+    num_basis=12,
+    ode_hidden=128,
+    dropout=0.1)
+
+    
+    print("Training KanFet-MLP-NODE (No Latent Embeddings)...")
+    kanfet_mlp_nolatent_model, kanfet_mlp_nolatent_train_acc, kanfet_mlp_nolatent_test_acc = \
+        train_kan_fet_mlp_node_nolatentembeddings (
+    train_path="data/ECG200_TRAIN.txt",
+    test_path="data/ECG200_TEST.txt",
+    batch_size=8,
+    epochs=EPOCHS,
+    lr=5e-3,
+    weight_decay=1e-4,
+    device="cpu",
+
+    # Neural ODE / KAN knobs
+    latent_dim=1,
+    num_basis=12,
+    ode_hidden=128,
+    dropout=0.1,
+    solver="dopri5",
+    rtol=1e-2,
+    atol=1e-3,
+   )
+
+    print("Training KanFet-MLP-NODE (Latent Space Embedded)...")
+
+    kan_fet_mlp_node_model, kan_fet_mlp_node_train_acc, kan_fet_mlp_node_test_acc = train_kan_fet_mlp_node(
+    train_path="data/ECG200_TRAIN.txt",
+    test_path="data/ECG200_TEST.txt",
+    batch_size=8,
+    epochs=EPOCHS,
     lr=5e-3,
     weight_decay=1e-4,
     device="cpu",
@@ -574,19 +1141,26 @@ if __name__ == "__main__":
     ode_hidden=128,
     dropout=0.1,
     solver="dopri5",
-    rtol=1e-3,
-    atol=1e-4,
+    rtol=1e-2,
+    atol=1e-3,
    )
 
-
     plt.figure(figsize=(10, 7))
-    KAN_COLOR  = "#1f77b4"  # blue
-    ODE_COLOR  = "#d62728"  # red
+    KANFET_RNN_COLOR  = "#1f77b4"  # blue
+    KAN_NODE_COLOR  = "#d62728"  # red
     KAN_FET_ODE_color = "#2ca02c"  # green
 
-    plt.plot(kan_fet_ode_train_acc, color=KAN_FET_ODE_color, label="KAN-FET-NODE Train Loss", linewidth=3)
-    plt.plot(base_knn_train_acc, color=KAN_COLOR, label="KAN-NN Train Loss", linewidth=3)
-    plt.plot(node_model_train_acc, color=ODE_COLOR, label="Neural ODE (NODE) Train Loss", linewidth=3)
+    # --- additional colors ---
+    KANFET_MLP_COLOR        = "#ff7f0e"  # orange
+    KANFET_MLP_NODE_COLOR = "#9467bd" # purple
+    KANFET_MLP_NODE_NOLATENTEMBEDDINGS_COLOR   = "#8c564b"  # brown
+
+    plt.plot(kan_fet_ode_train_acc, color=KAN_FET_ODE_color, label="KanFet-NODE (No Latent Space) Train Loss", linewidth=3)
+    plt.plot(base_knn_train_acc, color=KANFET_RNN_COLOR, label="KanFet-RNN (No Latent Space) Train Loss", linewidth=3)
+    plt.plot(node_model_train_acc, color=KAN_NODE_COLOR, label="KAN-NODE (No Latent Space) Train Loss", linewidth=3)
+    plt.plot(kan_fet_mlp_train_acc, color=KANFET_MLP_COLOR, label="KanFet-MLP (No Latent Space) Train Loss", linewidth=3)
+    plt.plot(kanfet_mlp_nolatent_train_acc, color=KANFET_MLP_NODE_NOLATENTEMBEDDINGS_COLOR, label="KanFet-MLP-NODE (No Latent Space) Train Loss", linewidth=3)
+    plt.plot(kan_fet_mlp_node_train_acc, color=KANFET_MLP_NODE_COLOR, label="KanFet-MLP-NODE (Latent Space Embedded) Train Loss", linewidth=3)
 
 
     plt.xlabel("Epoch", fontsize=20)
@@ -604,9 +1178,12 @@ if __name__ == "__main__":
 
 
     plt.figure(figsize=(10, 7))
-    plt.plot(kan_fet_ode_test_acc, color=KAN_FET_ODE_color, label="KAN-FET-NODE Test Acc", linewidth=3)
-    plt.plot(base_knn_test_acc, color=KAN_COLOR, label="KAN-NN Test Acc", linewidth=3)
-    plt.plot(node_model_test_acc, color=ODE_COLOR, label="Neural ODE (NODE) Test Acc", linewidth=3)
+    plt.plot(kan_fet_ode_test_acc, color=KAN_FET_ODE_color, label="KanFet-NODE (No Latent Space) Test Accuracy", linewidth=3)
+    plt.plot(base_knn_test_acc, color=KANFET_RNN_COLOR, label="KanFet-RNN (No Latent Space) Test Accuracy", linewidth=3)
+    plt.plot(node_model_test_acc, color=KAN_NODE_COLOR, label="KAN-NODE (No Latent Space) Test Accuracy", linewidth=3)
+    plt.plot(kan_fet_mlp_test_acc, color=KANFET_MLP_COLOR, label="KanFet-MLP (No Latent Space) Test Accuracy", linewidth=3)
+    plt.plot(kanfet_mlp_nolatent_test_acc, color=KANFET_MLP_NODE_NOLATENTEMBEDDINGS_COLOR, label="KanFet-MLP-NODE (No Latent Space) Test Accuracy", linewidth=3)
+    plt.plot(kan_fet_mlp_node_test_acc, color=KANFET_MLP_NODE_COLOR, label="KanFet-MLP-NODE (Latent Space Embedded) Test Accuracy", linewidth=3)
 
     plt.xlabel("Epoch", fontsize=20)
     plt.ylabel("Accuracy", fontsize=20)
