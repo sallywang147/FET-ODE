@@ -261,13 +261,24 @@ def train_KAN_NODE(
             optimizer.step()
             running += loss.item() * y.size(0)
 
-        train_loss = running / len(train_ds)
-        acc = eval_acc(model, test_loader, device)
-        best = max(best, acc)
-        acc_test_list.append(acc)
-        acc_train_list.append(train_loss)
+        # Evaluation
+        model.eval()
+        def evaluate(loader):
+            preds, targets = [], []
+            for X, y in loader:
+                out = model(X)
+                pred = out.argmax(dim=1)
+                preds.extend(pred.cpu().numpy())
+                targets.extend(y.cpu().numpy())
+            return accuracy_score(targets, preds)
+        train_loss = running / len(train_set)
+        acc_train = evaluate(train_loader)
+        acc_test = evaluate(test_loader)
+        acc_train_list.append(acc_train)
+        acc_test_list.append(acc_test)
+        acc = eval_acc(model, test_loader, "cpu")
         if ep % 10 == 0 or ep == 1:
-            print(f"Epoch {ep:3d} | train_loss {train_loss:.6f} | test_acc {acc*100:.2f}% | best {best*100:.2f}%")
+            print(f"Epoch {ep:3d} | train_loss {train_loss:.6f} | test_acc {acc*100:.2f}%")
 
     return model, acc_train_list, acc_test_list
 
@@ -552,18 +563,29 @@ def train_kan_fet_node(
         train_loss = running / len(train_ds)
         acc = eval_acc(model, test_loader, device)
 
-        best = max(best, acc)
-        train_loss_list.append(train_loss)
-        test_acc_list.append(acc)
 
+        
+
+        # Evaluation
+        model.eval()
+        def evaluate(loader):
+            preds, targets = [], []
+            for X, y in loader:
+                out = model(X)
+                pred = out.argmax(dim=1)
+                preds.extend(pred.cpu().numpy())
+                targets.extend(y.cpu().numpy())
+            return accuracy_score(targets, preds)
+        acc_train = evaluate(train_loader)
+        acc_test = evaluate(test_loader)
+        test_acc_list.append(acc_test)
+        acc = eval_acc(model, test_loader, "cpu")
         if ep % 10 == 0 or ep == 1:
             print(
                 f"Epoch {ep:3d} | "
                 f"train_loss {train_loss:.6f} | "
                 f"test_acc {acc*100:.2f}% | "
-                f"best {best*100:.2f}%"
             )
-
     return model, train_loss_list, test_acc_list
 
 
@@ -867,8 +889,6 @@ def train_kan_fet_mlp_node_nolatentembeddings(
 
         train_loss = running / len(train_ds)
         acc = eval_acc(model, test_loader, device)
-
-        best = max(best, acc)
         train_loss_list.append(train_loss)
         test_acc_list.append(acc)
 
@@ -877,7 +897,6 @@ def train_kan_fet_mlp_node_nolatentembeddings(
                 f"Epoch {ep:3d} | "
                 f"train_loss {train_loss:.6f} | "
                 f"test_acc {acc*100:.2f}% | "
-                f"best {best*100:.2f}%"
             )
 
     return model, train_loss_list, test_acc_list
@@ -1017,20 +1036,29 @@ def train_kan_fet_mlp_node(
             running += loss.item() * y.size(0)
 
         train_loss = running / len(train_ds)
-        acc = eval_acc(model, test_loader, device)
+        #acc = eval_acc(model, test_loader, device)
 
-        best = max(best, acc)
-        train_loss_list.append(train_loss)
-        test_acc_list.append(acc)
 
+        # Evaluation
+        model.eval()
+        def evaluate(loader):
+            preds, targets = [], []
+            for X, y in loader:
+                out = model(X)
+                pred = out.argmax(dim=1)
+                preds.extend(pred.cpu().numpy())
+                targets.extend(y.cpu().numpy())
+            return accuracy_score(targets, preds)
+        acc_train = evaluate(train_loader)
+        acc_test = evaluate(test_loader)
+        test_acc_list.append(acc_test)
+        acc = eval_acc(model, test_loader, "cpu")
         if ep % 10 == 0 or ep == 1:
             print(
                 f"Epoch {ep:3d} | "
                 f"train_loss {train_loss:.6f} | "
                 f"test_acc {acc*100:.2f}% | "
-                f"best {best*100:.2f}%"
             )
-
     return model, train_loss_list, test_acc_list
 
 # =========================
