@@ -283,7 +283,7 @@ def train_KAN_RNN(epochs):
     optimizer = optim.Adam(model.parameters(), lr=1e-2)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
     acc_train_list, acc_test_list = [], []
-
+    running = 0.0
     for epoch in range(epochs):
         model.train()
         for X_batch, y_batch in train_loader:
@@ -292,6 +292,7 @@ def train_KAN_RNN(epochs):
             loss = criterion(logits, y_batch)
             loss.backward()
             optimizer.step()
+            running += loss.item() * y_batch.size(0)
         scheduler.step()
 
         # Evaluation
@@ -304,11 +305,14 @@ def train_KAN_RNN(epochs):
                 preds.extend(pred.cpu().numpy())
                 targets.extend(y.cpu().numpy())
             return accuracy_score(targets, preds)
-
+        train_loss = running / len(train_set)
         acc_train = evaluate(train_loader)
         acc_test = evaluate(test_loader)
         acc_train_list.append(acc_train)
         acc_test_list.append(acc_test)
+        acc = eval_acc(model, test_loader, "cpu")
+        if epoch % 10 == 0 or epoch == 1:
+            print(f"Epoch {epoch:3d} | train_loss {train_loss:.6f} | test_acc {acc*100:.2f}%")
     return model, acc_train_list, acc_test_list
 
 
@@ -1051,17 +1055,18 @@ def eval_acc(model, loader, device):
 if __name__ == "__main__":
     # Put ECG200_TRAIN.txt / ECG200_TEST.txt in the same folder or pass paths.
 
-    EPOCHS = 100
+    EPOCHS = 400
 
     print("Training KAN-NODE...")
-
+    '''
     node_model, node_model_train_acc, node_model_test_acc = train_KAN_NODE(
         train_path="data/ECG200_TRAIN.txt",
-        test_path="data/ECG200_TEST.txt",
+        test_pah="data/ECG200_TEST.txt",
         batch_size=4,
         epochs=EPOCHS,
         lr=1e-2,
     )
+    '''
     print("Training KanFet-RNN...")
     base_knn_model, base_knn_train_acc, base_knn_test_acc = train_KAN_RNN(EPOCHS)
 
@@ -1084,7 +1089,7 @@ if __name__ == "__main__":
     rtol=1e-2,
     atol=1e-3,
    )
-
+    '''
 
     print("Training KanFet-MLP...")
     kan_fet_mlp_model, kan_fet_mlp_train_acc, kan_fet_mlp_test_acc = train_kan_fet_mlp (
@@ -1123,6 +1128,7 @@ if __name__ == "__main__":
     rtol=1e-2,
     atol=1e-3,
    )
+    '''
 
     print("Training KanFet-MLP-NODE (Latent Space Embedded)...")
 
@@ -1155,11 +1161,11 @@ if __name__ == "__main__":
     KANFET_MLP_NODE_COLOR = "#9467bd" # purple
     KANFET_MLP_NODE_NOLATENTEMBEDDINGS_COLOR   = "#8c564b"  # brown
 
-    plt.plot(kan_fet_ode_train_acc, color=KAN_FET_ODE_color, label="KanFet-NODE (No Latent Space) Train Loss", linewidth=3)
     plt.plot(base_knn_train_acc, color=KANFET_RNN_COLOR, label="KanFet-RNN (No Latent Space) Train Loss", linewidth=3)
-    plt.plot(node_model_train_acc, color=KAN_NODE_COLOR, label="KAN-NODE (No Latent Space) Train Loss", linewidth=3)
-    plt.plot(kan_fet_mlp_train_acc, color=KANFET_MLP_COLOR, label="KanFet-MLP (No Latent Space) Train Loss", linewidth=3)
-    plt.plot(kanfet_mlp_nolatent_train_acc, color=KANFET_MLP_NODE_NOLATENTEMBEDDINGS_COLOR, label="KanFet-MLP-NODE (No Latent Space) Train Loss", linewidth=3)
+    plt.plot(kan_fet_ode_train_acc, color=KAN_FET_ODE_color, label="KanFet-NODE (Latent Space Embedded) Train Loss", linewidth=3)
+    #plt.plot(node_model_train_acc, color=KAN_NODE_COLOR, label="KAN-NODE (No Latent Space) Train Loss", linewidth=3)
+    #plt.plot(kan_fet_mlp_train_acc, color=KANFET_MLP_COLOR, label="KanFet-MLP (No Latent Space) Train Loss", linewidth=3)
+    #plt.plot(kanfet_mlp_nolatent_train_acc, color=KANFET_MLP_NODE_NOLATENTEMBEDDINGS_COLOR, label="KanFet-MLP-NODE (No Latent Space) Train Loss", linewidth=3)
     plt.plot(kan_fet_mlp_node_train_acc, color=KANFET_MLP_NODE_COLOR, label="KanFet-MLP-NODE (Latent Space Embedded) Train Loss", linewidth=3)
 
 
@@ -1178,11 +1184,11 @@ if __name__ == "__main__":
 
 
     plt.figure(figsize=(10, 7))
-    plt.plot(kan_fet_ode_test_acc, color=KAN_FET_ODE_color, label="KanFet-NODE (No Latent Space) Test Accuracy", linewidth=3)
     plt.plot(base_knn_test_acc, color=KANFET_RNN_COLOR, label="KanFet-RNN (No Latent Space) Test Accuracy", linewidth=3)
-    plt.plot(node_model_test_acc, color=KAN_NODE_COLOR, label="KAN-NODE (No Latent Space) Test Accuracy", linewidth=3)
-    plt.plot(kan_fet_mlp_test_acc, color=KANFET_MLP_COLOR, label="KanFet-MLP (No Latent Space) Test Accuracy", linewidth=3)
-    plt.plot(kanfet_mlp_nolatent_test_acc, color=KANFET_MLP_NODE_NOLATENTEMBEDDINGS_COLOR, label="KanFet-MLP-NODE (No Latent Space) Test Accuracy", linewidth=3)
+    plt.plot(kan_fet_ode_test_acc, color=KAN_FET_ODE_color, label="KanFet-NODE (Latent Space Embedded) Test Accuracy", linewidth=3)
+    #plt.plot(node_model_test_acc, color=KAN_NODE_COLOR, label="KAN-NODE (No Latent Space) Test Accuracy", linewidth=3)
+    #plt.plot(kan_fet_mlp_test_acc, color=KANFET_MLP_COLOR, label="KanFet-MLP (No Latent Space) Test Accuracy", linewidth=3)
+    #plt.plot(kanfet_mlp_nolatent_test_acc, color=KANFET_MLP_NODE_NOLATENTEMBEDDINGS_COLOR, label="KanFet-MLP-NODE (No Latent Space) Test Accuracy", linewidth=3)
     plt.plot(kan_fet_mlp_node_test_acc, color=KANFET_MLP_NODE_COLOR, label="KanFet-MLP-NODE (Latent Space Embedded) Test Accuracy", linewidth=3)
 
     plt.xlabel("Epoch", fontsize=20)
