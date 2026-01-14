@@ -47,7 +47,7 @@ def load_ecg200(path="data/ECG200_TRAIN.txt", path_test="data/ECG200_TEST.txt"):
     y_train, y_test = _encode_labels_consistently(y_train, y_test)
     return ECG200Dataset(X_train, y_train), ECG200Dataset(X_test, y_test)
 
-
+'''
 class LogisticBasis(nn.Module):
     def __init__(self, in_dim, num_basis):
         super().__init__()
@@ -56,7 +56,91 @@ class LogisticBasis(nn.Module):
 
     def forward(self, x):  # x: (B, in_dim)
         x = x.unsqueeze(-1)  # → (B, in_dim, 1)
+
+        up = 2 / (1 + torch.exp(-self.a * (x - self.b)))
+        down = 2 / (1 + torch.exp(-self.a * (x + self.b)))
+
         return 2 / (1 + torch.exp(-self.a * (x - self.b)))  # (B, in_dim, num_basis)
+'''
+
+
+class LogisticBasis(nn.Module):
+    """
+    Differentiable hysteretic logistic basis with up/down branches.
+
+    Output shape matches your original LogisticBasis:
+      forward(x): (B, in_dim, num_basis)
+
+    Notes:
+    - Uses a persistent buffer prev_x (1, in_dim, num_basis) to infer sweep direction.
+    - Uses a *soft* gate g = sigmoid(slope * (x - prev_x)) to select up/down branches,
+      which keeps the forward differentiable.
+    - prev_x is updated with .detach() (stateful memory, not part of gradient graph).
+    """
+    def __init__(
+        self,
+        in_dim: int,
+        num_basis: int,
+        gate_slope: float = 5.0,   # higher -> more "hard" branch selection
+        init_prev: float = 0.0,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.in_dim = in_dim
+        self.num_basis = num_basis
+        self.gate_slope = gate_slope
+        self.eps = eps
+
+        # Same learnables as your LogisticBasis
+        self.a = nn.Parameter(torch.randn(in_dim, num_basis))
+        self.b = nn.Parameter(torch.randn(in_dim, num_basis))
+
+        # Persistent memory (no gradient) for hysteresis
+        self.register_buffer("prev_x", torch.full((1, in_dim, num_basis), float(init_prev)))
+
+    def reset_state(self, value: float = 0.0):
+        """Call this at the start of a new sequence/trajectory if you want fresh hysteresis."""
+        with torch.no_grad():
+            self.prev_x.fill_(float(value))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, in_dim)
+        if x.dim() != 2 or x.size(1) != self.in_dim:
+            raise ValueError(f"x must be (B,{self.in_dim}), got {tuple(x.shape)}")
+
+        B = x.size(0)
+
+        # Expand to (B, in_dim, num_basis)
+        x_exp = x.unsqueeze(-1).expand(-1, -1, self.num_basis)
+
+        # Broadcast parameters: (in_dim, num_basis) -> (B, in_dim, num_basis)
+        a = self.a.unsqueeze(0)
+        b = self.b.unsqueeze(0)
+
+        # Two smooth branches (both differentiable)
+        # Up branch: centered at +b
+        up   = 2.0 / (1.0 + torch.exp(-a * (x_exp - b)))
+        down = 2.0 / (1.0 + torch.exp(-a * (x_exp + b)))
+
+        dx = x_exp - self.prev_x
+
+        # Soft gate for gradients to select branches
+        g_soft = torch.sigmoid(self.gate_slope * dx)          # (B,in,num_basis)
+
+        # Hard gate for forward (no blending)
+        g_hard = (g_soft > 0.5).to(x.dtype)                   # 0/1
+
+        # STE: forward uses hard, backward uses soft
+        g = g_hard + (g_soft - g_soft.detach())
+
+        # This is still differentiable and forward is exactly one branch:
+        # if g_hard is 0 or 1, basis == down or up exactly.
+        basis = g * up + (1.0 - g) * down
+
+        with torch.no_grad():
+            self.prev_x.copy_(x_exp[-1:, :, :].detach())
+
+        return basis
 
 
 
@@ -1083,10 +1167,9 @@ def eval_acc(model, loader, device):
 if __name__ == "__main__":
     # Put ECG200_TRAIN.txt / ECG200_TEST.txt in the same folder or pass paths.
 
-    EPOCHS = 400
-
-    print("Training KAN-NODE...")
+    EPOCHS = 200
     '''
+    print("Training KAN-NODE...")
     node_model, node_model_train_acc, node_model_test_acc = train_KAN_NODE(
         train_path="data/ECG200_TRAIN.txt",
         test_pah="data/ECG200_TEST.txt",
