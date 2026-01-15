@@ -12,6 +12,9 @@ from sklearn.metrics import accuracy_score
 # pip install torchdiffeq
 from torchdiffeq import odeint
 from kan_diffusion import kan
+
+#Experient note for future self: kan doesn't compose well with linear/MLP with drop out or extra activation
+#If we want to combine them, do it at the end with a single linear layer usually works.
 # =========================
 # Dataset (yours)
 # =========================
@@ -35,19 +38,19 @@ def _encode_labels_consistently(y_train, y_test):
 
 def load_ecg200(path="data/ECG200_TRAIN.txt", path_test="data/ECG200_TEST.txt"):
     def load_file(p):
-        df = pd.read_csv(p, header=None, sep='\s+')
+        df = pd.read_csv(p, sep="\s+", engine="python")
         y = df.iloc[:, 0].values
         x = df.iloc[:, 1:].values
         x = (x - x.mean(axis=1, keepdims=True)) / (x.std(axis=1, keepdims=True) + 1e-8)
         return x, y
 
-    X_train, y_train = load_file(path)
-    X_test, y_test = load_file(path_test)
+    X_train, y_train = load_file(str(path))
+    X_test, y_test = load_file(str(path_test))
 
     y_train, y_test = _encode_labels_consistently(y_train, y_test)
     return ECG200Dataset(X_train, y_train), ECG200Dataset(X_test, y_test)
 
-'''
+
 class LogisticBasis(nn.Module):
     def __init__(self, in_dim, num_basis):
         super().__init__()
@@ -56,91 +59,7 @@ class LogisticBasis(nn.Module):
 
     def forward(self, x):  # x: (B, in_dim)
         x = x.unsqueeze(-1)  # → (B, in_dim, 1)
-
-        up = 2 / (1 + torch.exp(-self.a * (x - self.b)))
-        down = 2 / (1 + torch.exp(-self.a * (x + self.b)))
-
         return 2 / (1 + torch.exp(-self.a * (x - self.b)))  # (B, in_dim, num_basis)
-'''
-
-
-class LogisticBasis(nn.Module):
-    """
-    Differentiable hysteretic logistic basis with up/down branches.
-
-    Output shape matches your original LogisticBasis:
-      forward(x): (B, in_dim, num_basis)
-
-    Notes:
-    - Uses a persistent buffer prev_x (1, in_dim, num_basis) to infer sweep direction.
-    - Uses a *soft* gate g = sigmoid(slope * (x - prev_x)) to select up/down branches,
-      which keeps the forward differentiable.
-    - prev_x is updated with .detach() (stateful memory, not part of gradient graph).
-    """
-    def __init__(
-        self,
-        in_dim: int,
-        num_basis: int,
-        gate_slope: float = 5.0,   # higher -> more "hard" branch selection
-        init_prev: float = 0.0,
-        eps: float = 1e-6,
-    ):
-        super().__init__()
-        self.in_dim = in_dim
-        self.num_basis = num_basis
-        self.gate_slope = gate_slope
-        self.eps = eps
-
-        # Same learnables as your LogisticBasis
-        self.a = nn.Parameter(torch.randn(in_dim, num_basis))
-        self.b = nn.Parameter(torch.randn(in_dim, num_basis))
-
-        # Persistent memory (no gradient) for hysteresis
-        self.register_buffer("prev_x", torch.full((1, in_dim, num_basis), float(init_prev)))
-
-    def reset_state(self, value: float = 0.0):
-        """Call this at the start of a new sequence/trajectory if you want fresh hysteresis."""
-        with torch.no_grad():
-            self.prev_x.fill_(float(value))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, in_dim)
-        if x.dim() != 2 or x.size(1) != self.in_dim:
-            raise ValueError(f"x must be (B,{self.in_dim}), got {tuple(x.shape)}")
-
-        B = x.size(0)
-
-        # Expand to (B, in_dim, num_basis)
-        x_exp = x.unsqueeze(-1).expand(-1, -1, self.num_basis)
-
-        # Broadcast parameters: (in_dim, num_basis) -> (B, in_dim, num_basis)
-        a = self.a.unsqueeze(0)
-        b = self.b.unsqueeze(0)
-
-        # Two smooth branches (both differentiable)
-        # Up branch: centered at +b
-        up   = 2.0 / (1.0 + torch.exp(-a * (x_exp - b)))
-        down = 2.0 / (1.0 + torch.exp(-a * (x_exp + b)))
-
-        dx = x_exp - self.prev_x
-
-        # Soft gate for gradients to select branches
-        g_soft = torch.sigmoid(self.gate_slope * dx)          # (B,in,num_basis)
-
-        # Hard gate for forward (no blending)
-        g_hard = (g_soft > 0.5).to(x.dtype)                   # 0/1
-
-        # STE: forward uses hard, backward uses soft
-        g = g_hard + (g_soft - g_soft.detach())
-
-        # This is still differentiable and forward is exactly one branch:
-        # if g_hard is 0 or 1, basis == down or up exactly.
-        basis = g * up + (1.0 - g) * down
-
-        with torch.no_grad():
-            self.prev_x.copy_(x_exp[-1:, :, :].detach())
-
-        return basis
 
 
 
@@ -255,7 +174,7 @@ class KAN_NODE(nn.Module):
             nn.AdaptiveAvgPool1d(1),  # (B, C, 1)
         )
 
-        # ✅ no latent projection: state is just pooled conv features (B, C)
+        # no latent projection: state is just pooled conv features (B, C)
         self.to_state = nn.Sequential(
             nn.Flatten(),          # (B, C)
             nn.Dropout(dropout),
@@ -299,8 +218,8 @@ def eval_acc(model, loader, device):
     return correct / max(total, 1)
 
 def train_KAN_NODE(
-    train_path="/data/ECG200_TRAIN.txt",
-    test_path="/data/ECG200_TEST.txt",
+    train_path="data/ECG200_TRAIN.txt",
+    test_path="data/ECG200_TEST.txt",
     batch_size=4,
     epochs=100,
     lr=1e-2,
@@ -355,7 +274,7 @@ def train_KAN_NODE(
                 preds.extend(pred.cpu().numpy())
                 targets.extend(y.cpu().numpy())
             return accuracy_score(targets, preds)
-        train_loss = running / len(train_set)
+        train_loss = running / len(train_ds)
         acc_train = evaluate(train_loader)
         acc_test = evaluate(test_loader)
         acc_train_list.append(acc_train)
@@ -366,8 +285,11 @@ def train_KAN_NODE(
 
     return model, acc_train_list, acc_test_list
 
-def train_KAN_RNN(epochs):
-    train_set, test_set = load_ecg200()
+def train_KAN_RNN(
+    train_path="data/ECG200_TRAIN.txt",
+    test_path="data/ECG200_TEST.txt",
+    epochs=100):
+    train_set, test_set = load_ecg200(train_path, test_path)
     # plot_example_signals(train_set)
 
     train_loader = DataLoader(train_set, batch_size=4, shuffle=True)
@@ -645,6 +567,7 @@ def train_kan_fet_node(
             running += loss.item() * y.size(0)
 
         train_loss = running / len(train_ds)
+        train_loss_list.append(train_loss)
         acc = eval_acc(model, test_loader, device)
 
 
@@ -1120,6 +1043,7 @@ def train_kan_fet_mlp_node(
             running += loss.item() * y.size(0)
 
         train_loss = running / len(train_ds)
+        train_loss_list.append(train_loss)
         #acc = eval_acc(model, test_loader, device)
 
 
@@ -1167,9 +1091,10 @@ def eval_acc(model, loader, device):
 if __name__ == "__main__":
     # Put ECG200_TRAIN.txt / ECG200_TEST.txt in the same folder or pass paths.
 
-    EPOCHS = 200
+    EPOCHS = 100
+
+    print("Training KAN-NODE..hello.")
     '''
-    print("Training KAN-NODE...")
     node_model, node_model_train_acc, node_model_test_acc = train_KAN_NODE(
         train_path="data/ECG200_TRAIN.txt",
         test_pah="data/ECG200_TEST.txt",
@@ -1179,7 +1104,8 @@ if __name__ == "__main__":
     )
     '''
     print("Training KanFet-RNN...")
-    base_knn_model, base_knn_train_acc, base_knn_test_acc = train_KAN_RNN(EPOCHS)
+    base_knn_model, base_knn_train_acc, base_knn_test_acc = train_KAN_RNN(epochs=EPOCHS)
+
 
     print("Training KanFet-NODE...")
     kan_fet_ode_model, kan_fet_ode_train_acc, kan_fet_ode_test_acc = train_kan_fet_node(
@@ -1200,6 +1126,8 @@ if __name__ == "__main__":
     rtol=1e-2,
     atol=1e-3,
    )
+
+
     '''
 
     print("Training KanFet-MLP...")
@@ -1267,17 +1195,17 @@ if __name__ == "__main__":
     KAN_NODE_COLOR  = "#d62728"  # red
     KAN_FET_ODE_color = "#2ca02c"  # green
 
-    # --- additional colors ---
+    # --- additional colors --
     KANFET_MLP_COLOR        = "#ff7f0e"  # orange
     KANFET_MLP_NODE_COLOR = "#9467bd" # purple
     KANFET_MLP_NODE_NOLATENTEMBEDDINGS_COLOR   = "#8c564b"  # brown
 
-    plt.plot(base_knn_train_acc, color=KANFET_RNN_COLOR, label="KanFet-RNN (No Latent Space) Train Loss", linewidth=3)
-    plt.plot(kan_fet_ode_train_acc, color=KAN_FET_ODE_color, label="KanFet-NODE (Latent Space Embedded) Train Loss", linewidth=3)
+    plt.plot(base_knn_train_acc, color=KANFET_RNN_COLOR, label="KanFEPA-RNN (No Latent Space) Train Loss", linewidth=3)
+    plt.plot(kan_fet_ode_train_acc, color=KAN_FET_ODE_color, label="KanFEPA-NODE (Latent Space Embedded) Train Loss", linewidth=3)
     #plt.plot(node_model_train_acc, color=KAN_NODE_COLOR, label="KAN-NODE (No Latent Space) Train Loss", linewidth=3)
-    #plt.plot(kan_fet_mlp_train_acc, color=KANFET_MLP_COLOR, label="KanFet-MLP (No Latent Space) Train Loss", linewidth=3)
-    #plt.plot(kanfet_mlp_nolatent_train_acc, color=KANFET_MLP_NODE_NOLATENTEMBEDDINGS_COLOR, label="KanFet-MLP-NODE (No Latent Space) Train Loss", linewidth=3)
-    plt.plot(kan_fet_mlp_node_train_acc, color=KANFET_MLP_NODE_COLOR, label="KanFet-MLP-NODE (Latent Space Embedded) Train Loss", linewidth=3)
+    #plt.plot(kan_fet_mlp_train_acc, color=KANFET_MLP_COLOR, label="KanFEPA-MLP (No Latent Space) Train Loss", linewidth=3)
+    #plt.plot(kanfet_mlp_nolatent_train_acc, color=KANFET_MLP_NODE_NOLATENTEMBEDDINGS_COLOR, label="KanFEPA-MLP-NODE (No Latent Space) Train Loss", linewidth=3)
+    plt.plot(kan_fet_mlp_node_train_acc, color=KANFET_MLP_NODE_COLOR, label="KanFEPA-MLP-NODE (Latent Space Embedded) Train Loss", linewidth=3)
 
 
     plt.xlabel("Epoch", fontsize=20)
@@ -1295,12 +1223,12 @@ if __name__ == "__main__":
 
 
     plt.figure(figsize=(10, 7))
-    plt.plot(base_knn_test_acc, color=KANFET_RNN_COLOR, label="KanFet-RNN (No Latent Space) Test Accuracy", linewidth=3)
-    plt.plot(kan_fet_ode_test_acc, color=KAN_FET_ODE_color, label="KanFet-NODE (Latent Space Embedded) Test Accuracy", linewidth=3)
+    plt.plot(base_knn_test_acc, color=KANFET_RNN_COLOR, label="KanFEPA-RNN (No Latent Space) Test Accuracy", linewidth=3)
+    plt.plot(kan_fet_ode_test_acc, color=KAN_FET_ODE_color, label="KanFEPA-NODE (Latent Space Embedded) Test Accuracy", linewidth=3)
     #plt.plot(node_model_test_acc, color=KAN_NODE_COLOR, label="KAN-NODE (No Latent Space) Test Accuracy", linewidth=3)
-    #plt.plot(kan_fet_mlp_test_acc, color=KANFET_MLP_COLOR, label="KanFet-MLP (No Latent Space) Test Accuracy", linewidth=3)
-    #plt.plot(kanfet_mlp_nolatent_test_acc, color=KANFET_MLP_NODE_NOLATENTEMBEDDINGS_COLOR, label="KanFet-MLP-NODE (No Latent Space) Test Accuracy", linewidth=3)
-    plt.plot(kan_fet_mlp_node_test_acc, color=KANFET_MLP_NODE_COLOR, label="KanFet-MLP-NODE (Latent Space Embedded) Test Accuracy", linewidth=3)
+    #plt.plot(kan_fet_mlp_test_acc, color=KANFET_MLP_COLOR, label="KanFEPA-MLP (No Latent Space) Test Accuracy", linewidth=3)
+    #plt.plot(kanfet_mlp_nolatent_test_acc, color=KANFET_MLP_NODE_NOLATENTEMBEDDINGS_COLOR, label="KanFEPA-MLP-NODE (No Latent Space) Test Accuracy", linewidth=3)
+    plt.plot(kan_fet_mlp_node_test_acc, color=KANFET_MLP_NODE_COLOR, label="KanFEPA-MLP-NODE (Latent Space Embedded) Test Accuracy", linewidth=3)
 
     plt.xlabel("Epoch", fontsize=20)
     plt.ylabel("Accuracy", fontsize=20)
