@@ -52,16 +52,86 @@ def load_ecg200(path="data/ECG200_TRAIN.txt", path_test="data/ECG200_TEST.txt"):
 
 
 class LogisticBasis(nn.Module):
-    def __init__(self, in_dim, num_basis):
+    """
+    Differentiable hysteretic logistic basis with up/down branches.
+
+    Output shape matches your original LogisticBasis:
+      forward(x): (B, in_dim, num_basis)
+
+    Notes:
+    - Uses a persistent buffer prev_x (1, in_dim, num_basis) to infer sweep direction.
+    - Uses a *soft* gate g = sigmoid(slope * (x - prev_x)) to select up/down branches,
+      which keeps the forward differentiable.
+    - prev_x is updated with .detach() (stateful memory, not part of gradient graph).
+    """
+    def __init__(
+        self,
+        in_dim: int,
+        num_basis: int,
+        gate_slope: float = 5.0,   # higher -> more "hard" branch selection
+        init_prev: float = 0.0,
+        eps: float = 1e-6,
+        branch_breaking_point=0.5,
+        use_noise=False, noise_std=0.05,
+    ):
         super().__init__()
-        self.a = nn.Parameter(torch.randn(in_dim, num_basis))
-        self.b = nn.Parameter(torch.randn(in_dim, num_basis))
+        self.in_dim = in_dim
+        self.num_basis = num_basis
+        self.gate_slope = gate_slope
+        self.eps = eps
+        self.use_noise = use_noise
+        self.noise_std = noise_std
+        self.branch_breaking_point=branch_breaking_point
 
-    def forward(self, x):  # x: (B, in_dim)
-        x = x.unsqueeze(-1)  # → (B, in_dim, 1)
-        return 2 / (1 + torch.exp(-self.a * (x - self.b)))  # (B, in_dim, num_basis)
+        # Learnable parameters for each basis function
+        self.k = nn.Parameter(torch.rand(in_dim, num_basis) * 2 + 0.5)  # slope [0.5, 2.5]
+        self.Ec = nn.Parameter(torch.rand(in_dim, num_basis) * 2 + 0.5)  # coercive field [0.5, 2.5]
+        self.Ps = nn.Parameter(torch.rand(in_dim, num_basis) * 1.5 + 0.5)  # saturation [0.5, 2.0]
+        self.bias = nn.Parameter(torch.randn(in_dim, num_basis) * 0.1)  # small bias
+        self.coef = nn.Parameter(torch.randn(in_dim, num_basis))  # weights
+        # Persistent memory (no gradient) for hysteresis
+        self.register_buffer("prev_x", torch.zeros(1, in_dim, num_basis))
+        self.register_buffer("branch_state", torch.ones(1, in_dim, num_basis))  
+
+    def reset_state(self, value: float = 0.0):
+        """Call this at the start of a new sequence/trajectory if you want fresh hysteresis."""
+        self.prev_x.zero_()
+        self.branch_state.fill_(1.0)
 
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, in_dim)
+        if x.dim() != 2 or x.size(1) != self.in_dim:
+            raise ValueError(f"x must be (B,{self.in_dim}), got {tuple(x.shape)}")
+
+        B = x.size(0)
+
+        # Expand to (B, in_dim, num_basis)
+        x_exp = x.unsqueeze(-1).expand(-1, -1, self.num_basis)
+
+        # Broadcast parameters: (in_dim, num_basis) -> (B, in_dim, num_basis)
+
+        # Two smooth branches (both differentiable)
+        # Up branch: centered at +b
+        up   = self.Ps * (1 / (1 + torch.exp(-self.k * (x_exp - self.Ec)))) * 2 - self.Ps
+        down =  self.Ps * (1 / (1 + torch.exp(-self.k * (x_exp + self.Ec)))) * 2 - self.Ps
+
+        dx = x_exp - self.prev_x
+
+        # Soft gate for gradients to select branches
+        g = torch.sigmoid(self.gate_slope * dx)          # (B,in,num_basis)
+        self.branch_state = (g > self.branch_breaking_point).float()
+
+        basis = self.branch_state * up + (1.0 - self.branch_state) * down + self.bias
+
+        if self.use_noise:
+                noise = torch.randn_like(basis) * self.noise_std
+                basis = basis + noise.detach()
+
+        with torch.no_grad():
+            self.prev_x.copy_(x_exp[-1:, :, :].detach())
+
+        return basis
 
 class FullyNonlinearKANCell(nn.Module):
     def __init__(self, input_size, hidden_size, num_basis):
@@ -1102,12 +1172,12 @@ if __name__ == "__main__":
         epochs=EPOCHS,
         lr=1e-2,
     )
-    '''
+
     print("Training KanFet-RNN...")
     base_knn_model, base_knn_train_acc, base_knn_test_acc = train_KAN_RNN(epochs=EPOCHS)
 
-
-    print("Training KanFet-NODE...")
+    '''
+    print("Training KanFEPA-NODE...")
     kan_fet_ode_model, kan_fet_ode_train_acc, kan_fet_ode_test_acc = train_kan_fet_node(
     train_path="data/ECG200_TRAIN.txt",
     test_path="data/ECG200_TEST.txt",
@@ -1169,7 +1239,7 @@ if __name__ == "__main__":
    )
     '''
 
-    print("Training KanFet-MLP-NODE (Latent Space Embedded)...")
+    print("Training KanFEPA-MLP-NODE (Latent Space Embedded)...")
 
     kan_fet_mlp_node_model, kan_fet_mlp_node_train_acc, kan_fet_mlp_node_test_acc = train_kan_fet_mlp_node(
     train_path="data/ECG200_TRAIN.txt",
