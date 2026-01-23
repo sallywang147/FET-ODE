@@ -12,15 +12,9 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score
 # pip install torchdiffeq
 from torchdiffeq import odeint
-from kan_diffusion import kan
-from efficient_kan.efficientkan import KANFET
-from ferro_class import FerroelectricBasis, BatchedFerroelectricBasis
+from ferro_class import NoisyFerroelectricBasis, NoisyBatchedFerroelectricBasis
 
-#Experient note for future self: kan doesn't compose well with linear/MLP with drop out or extra activation
-#If we want to combine them, do it at the end with a single linear layer usually works.
-# =========================
-# Dataset (yours)
-# =========================
+
 class ECG200Dataset(torch.utils.data.Dataset):
     def __init__(self, X, y):
         self.X = torch.tensor(X, dtype=torch.float32)  # (N, T)
@@ -196,8 +190,8 @@ def train_rnn_baseline(
 class FullyNonlinearKANCell(nn.Module):
     def __init__(self, input_size, hidden_size, num_basis):
         super().__init__()
-        self.input_basis = BatchedFerroelectricBasis(input_size, hidden_size, num_basis)
-        self.hidden_basis = BatchedFerroelectricBasis(hidden_size, hidden_size, num_basis)
+        self.input_basis = NoisyBatchedFerroelectricBasis(input_size, hidden_size, num_basis)
+        self.hidden_basis = NoisyBatchedFerroelectricBasis(hidden_size, hidden_size, num_basis)
         self.activation = torch.tanh
         self.hidden_size = hidden_size
         self.num_basis = num_basis
@@ -213,7 +207,7 @@ class FullyNonlinearKANCell(nn.Module):
 class KANClassifier(nn.Module):
     def __init__(self, in_dim,  hidden_dim, num_classes, num_basis):
         super().__init__()
-        self.basis = BatchedFerroelectricBasis(in_dim,  hidden_dim, num_basis)
+        self.basis = NoisyBatchedFerroelectricBasis(in_dim,  hidden_dim, num_basis)
         self.activation = torch.tanh
         self.num_classes = num_classes
         self.hidden_dim = hidden_dim
@@ -252,7 +246,7 @@ class FullyNonlinearKANRNN(nn.Module):
 @torch.no_grad()
 def reset_stateful_ferro_buffers(m):
     for mm in m.modules():
-        if mm.__class__.__name__ == "FerroelectricBasis":
+        if mm.__class__.__name__ == "NoisyFerroelectricBasis":
             if hasattr(mm, "prev_x") and mm.prev_x is not None:
                 mm.prev_x.zero_()
             if hasattr(mm, "branch_sign") and mm.branch_sign is not None:
@@ -359,7 +353,7 @@ class InputDrivenKANODEFunc(nn.Module):
         self.hidden_size = hidden_size
 
         # map concat([h, x]) -> hidden
-        self.basis = FerroelectricBasis(hidden_size + input_size, hidden_size, num_basis)
+        self.basis = NoisyFerroelectricBasis(hidden_size + input_size, hidden_size, num_basis)
 
         self.gain = nn.Parameter(torch.ones(hidden_size))
         self.bias = nn.Parameter(torch.zeros(hidden_size))
@@ -438,7 +432,7 @@ class NODE_RNN(nn.Module):
         self.enc = OneODEEncoder(input_size, hidden_size, num_basis, solver=solver, rtol=rtol, atol=atol)
         #self.dropout = nn.Dropout(dropout)
         self.rnn_cell = FullyNonlinearKANCell(hidden_size, hidden_size, num_basis)
-        self.head = nn.Linear(hidden_size, num_classes) #digital classifier
+        self.head = nn.Linear(hidden_size, num_classes)
 
     def forward(self, x):
         # x: (B,T) or (B,T,D)
@@ -567,7 +561,22 @@ def train_rnn_node(
             )
 
     return model, train_loss_list, test_acc_list
-# -------------------- MLP-NODE Function --------------------
+
+# =========================
+# Train / Eval
+# =========================
+@torch.no_grad()
+def eval_acc(model, loader, device):
+    model.eval()
+    correct, total = 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
+        pred = logits.argmax(dim=-1)
+        correct += (pred == y).sum().item()
+        total += y.numel()
+    return correct / max(total, 1)
+
 
 
 class KANFetODEFunc(nn.Module):
@@ -577,9 +586,9 @@ class KANFetODEFunc(nn.Module):
         #we should use SmoothFerroElectricBasis below; 
         #otherwise, if we use KANFerroelectricBasis, solver states will explode 
         #due to non-differentiable branch switching
-        self.fc1 = FerroelectricBasis(latent_dim, hidden_dim, num_basis)
+        self.fc1 = NoisyFerroelectricBasis(latent_dim, hidden_dim, num_basis)
         self.act = nn.Tanh()  # or Sigmoid, GELU, etc.
-        self.fc2 =  FerroelectricBasis(hidden_dim, latent_dim, num_basis)
+        self.fc2 =  NoisyFerroelectricBasis(hidden_dim, latent_dim, num_basis)
 
     def forward(self, t, h):
         # h: (B, latent_dim) (or (latent_dim,) if B==1 in some uses)
@@ -622,10 +631,10 @@ class KanFet_MLP_NODE(nn.Module):
         self.rtol = rtol
         self.atol = atol
        
-        self.encoder = nn.Linear(T, latent_dim) #linear layer encoding in digital 
+        self.encoder = nn.Linear(T, latent_dim)
         self.odefunc = KANFetODEFunc(latent_dim=latent_dim, hidden_dim=ode_hidden, num_basis=num_basis)
         self.dropout = nn.Dropout(dropout)
-        self.cls =  nn.Linear(latent_dim, num_classes) #MLP classifier in digital 
+        self.cls =  nn.Linear(latent_dim, num_classes)
 
     def forward(self, x):  # x: (B, T)
         h0 = self.encoder(x)  # (B, latent_dim)
@@ -737,21 +746,6 @@ def train_kan_fet_mlp_node(
             )
     return model, train_loss_list, test_acc_list
 
-# =========================
-# Train / Eval
-# =========================
-@torch.no_grad()
-def eval_acc(model, loader, device):
-    model.eval()
-    correct, total = 0, 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        logits = model(x)
-        pred = logits.argmax(dim=-1)
-        correct += (pred == y).sum().item()
-        total += y.numel()
-    return correct / max(total, 1)
-
 
 
 
@@ -759,8 +753,8 @@ def eval_acc(model, loader, device):
 if __name__ == "__main__":
     # Put ECG200_TRAIN.txt / ECG200_TEST.txt in the same folder or pass paths.
 
-    EPOCHS = 300 #this is the sweet spot, if epochs>100, the acc of FEPA-RNN goes down afterwards
-    '''
+    EPOCHS = 100
+
     mlp_node_model, mlp_node_train_acc, mlp_node_test_acc =  train_kan_fet_mlp_node(
         train_path="data/ECG200_TRAIN.txt",
         test_path="data/ECG200_TEST.txt",
@@ -778,6 +772,21 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-4,
     )
+   
+    print("Training Baseline Digital RNN...")
+    digital_rnn_model, digital_rnn_train_loss, digital_rnn_test_acc = train_rnn_baseline(
+        train_path="data/ECG200_TRAIN.txt",
+        test_path="data/ECG200_TEST.txt",
+        batch_size=8,
+        epochs=EPOCHS,
+        lr=1e-5,
+        weight_decay=1e-4,
+        hidden_dim=64,
+        num_layers=1,
+        dropout=0.0,
+        bidirectional=True,
+        clip_grad=1.0,
+    )
 
 
     print("Training KanFEPA-RNN...")
@@ -794,7 +803,7 @@ if __name__ == "__main__":
     batch_size=1,
     epochs=EPOCHS,
     lr=5e-3,
-    weight_decay=1e-4,
+    weight_decay=1e-5,
     device="cpu",
 
     # Neural ODE / KAN knobs
@@ -807,31 +816,11 @@ if __name__ == "__main__":
    )
    
 
-    '''
-    print("Training Baseline Digital RNN...")
-    digital_rnn_model, digital_rnn_train_loss, digital_rnn_test_acc = train_rnn_baseline(
-        train_path="data/ECG200_TRAIN.txt",
-        test_path="data/ECG200_TEST.txt",
-        batch_size=8,
-        epochs=EPOCHS,
-        lr=1e-5,
-        weight_decay=1e-4,
-        hidden_dim=64,
-        num_layers=1, #1 layer is better than deeper layers
-        dropout=0.0,
-        bidirectional=True,
-        clip_grad=1.0,
-    )
-
-
-
-
     plt.figure(figsize=(10, 7))
     Digital_RNN_COLOR = "#2ca02c"  # green
     KANFET_RNN_COLOR  = "#1f77b4"  # blue
     KAN_NODE_COLOR  = "#d62728"  # red
     MLP_NODE_COLOR = "#bcbd22"  # yellow / olive
-
 
     plt.plot(digital_rnn_train_loss, color=Digital_RNN_COLOR, label="Digital RNN (Baseline) Train Loss", linewidth=3)
     plt.plot(base_rnn_train_acc, color=KANFET_RNN_COLOR, label="KanFEPA-RNN Train Loss", linewidth=3)
@@ -841,7 +830,7 @@ if __name__ == "__main__":
 
     plt.xlabel("Epoch", fontsize=20)
     plt.ylabel("Loss", fontsize=20)
-    plt.title("Training Loss (No Noise or Pertubations)", fontsize=30)
+    plt.title("Training Loss (20% Noise Per Basis)", fontsize=20)
 
     plt.xticks(fontsize=15)
     plt.yticks(fontsize=15)
@@ -862,7 +851,7 @@ if __name__ == "__main__":
 
     plt.xlabel("Epoch", fontsize=20)
     plt.ylabel("Accuracy", fontsize=20)
-    plt.title("Test Accuracy (No Noise or Pertubations)", fontsize=30)
+    plt.title("Test Accuracy (20% Noise Per Basis)", fontsize=20)
 
     plt.xticks(fontsize=15)
     plt.yticks(fontsize=15)
