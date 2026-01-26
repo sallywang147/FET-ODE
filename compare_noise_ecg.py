@@ -14,7 +14,7 @@ from sklearn.metrics import accuracy_score
 from torchdiffeq import odeint
 from kan_diffusion import kan
 from efficient_kan.efficientkan import KANFET
-from ferro_class import FerroelectricBasis, BatchedFerroelectricBasis
+from ferro_class import FerroelectricBasis
 
 
 
@@ -65,6 +65,128 @@ def ferro_params(layer, i_idx, o_idx, b_idx):
     Ec = float(layer.Ec [i_idx, o_idx, b_idx].detach().cpu())
     k  = float(layer.k  [i_idx, o_idx, b_idx].detach().cpu())
     return w, Ps, Ec, k
+
+
+
+def visualize_clean_vs_noisy_ferro_layer(
+    layer,
+    layer_name="layer",
+    field_range=(-5, 5),
+    n_points=200,
+    max_basis=5,
+    which_in_out=(0, 0),
+    noise_std=0.2,      # override layer.noise_std if provided
+    seed=0,              # seed for noisy curve so it’s repeatable
+):
+    """
+    Overlay clean vs noisy hysteresis loops for a single FerroelectricBasis-like layer.
+
+    Works for BOTH:
+      - BatchedFerroelectricBasis
+      - FerroelectricBasis
+
+    Assumes:
+      - layer.forward(x, return_activations=True) returns (_, basis, _)
+      - basis shape: (B, in_dim, out_dim, num_basis)
+      - layer has .use_noise and .noise_std
+    """
+    device = next(layer.parameters()).device
+
+    i_idx, o_idx = which_in_out
+    i_idx = int(np.clip(i_idx, 0, layer.in_dim - 1))
+    o_idx = int(np.clip(o_idx, 0, layer.out_dim - 1))
+
+    nb = min(max_basis, layer.num_basis)
+
+    E_up = torch.linspace(field_range[0], field_range[1], n_points, device=device)
+    E_dn = torch.linspace(field_range[1], field_range[0], n_points, device=device)
+
+    n_cols = min(2, nb)
+    n_rows = (nb + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 5 * n_rows))
+    if nb == 1:
+        axes = np.array([axes])
+    axes = axes.flatten()
+
+    # save & maybe override noise_std
+    old_use = layer.use_noise
+    old_std = layer.noise_std
+    if noise_std is not None:
+        layer.noise_std = float(noise_std)
+
+    def run_sweep(use_noise, seed_for_noise=None):
+        layer.use_noise = use_noise
+        if hasattr(layer, "reset_state"):
+            layer.reset_state()
+
+        if seed_for_noise is not None:
+            # Make the noise deterministic for visualization
+            torch.manual_seed(seed_for_noise)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed_for_noise)
+
+        P_up = [[] for _ in range(nb)]
+        P_dn = [[] for _ in range(nb)]
+
+        # Up sweep
+        for e in E_up:
+            x_in = torch.full((1, layer.in_dim), float(e.item()),
+                              device=device, dtype=torch.float32)
+            with torch.no_grad():
+                _, basis, _ = layer(x_in, return_activations=True)
+            for b in range(nb):
+                P_up[b].append(basis[0, i_idx, o_idx, b].item())
+
+        # Down sweep
+        for e in E_dn:
+            x_in = torch.full((1, layer.in_dim), float(e.item()),
+                              device=device, dtype=torch.float32)
+            with torch.no_grad():
+                _, basis, _ = layer(x_in, return_activations=True)
+            for b in range(nb):
+                P_dn[b].append(basis[0, i_idx, o_idx, b].item())
+
+        return P_up, P_dn
+
+    # ---- run clean then noisy (with reset between) ----
+    clean_up, clean_dn = run_sweep(use_noise=False, seed_for_noise=None)
+    noisy_up, noisy_dn = run_sweep(use_noise=True,  seed_for_noise=seed)
+
+    # ---- plot ----
+    for b_idx in range(nb):
+        ax = axes[b_idx]
+        w, Ps, Ec, k = ferro_params(layer, i_idx, o_idx, b_idx)
+
+        ax.plot(E_up.detach().cpu().numpy(), np.array(clean_up[b_idx]), linewidth=2, label="Clean up")
+        ax.plot(E_dn.detach().cpu().numpy(), np.array(clean_dn[b_idx]), linewidth=2, label="Clean down")
+
+        ax.plot(E_up.detach().cpu().numpy(), np.array(noisy_up[b_idx]),  linestyle="--", linewidth=2,
+                label=f"Noisy up (std={layer.noise_std:.3f})")
+        ax.plot(E_dn.detach().cpu().numpy(), np.array(noisy_dn[b_idx]),  linestyle="--", linewidth=2,
+                label="Noisy down")
+
+        ax.set_xlabel("Electric Field (E)")
+        ax.set_ylabel("Polarization (P)")
+        ax.set_title(
+            f"{layer_name} | basis {b_idx}\n"
+            f"w={w:.3f}, Ps={Ps:.3f}, Ec={Ec:.3f}, k={k:.3f}",
+            fontsize=10
+        )
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+
+    # hide unused
+    for j in range(nb, len(axes)):
+        axes[j].set_visible(False)
+
+    # restore
+    layer.use_noise = old_use
+    layer.noise_std = old_std
+
+    fig.suptitle(f"Clean vs Noisy Hysteresis: {layer_name}", fontsize=15)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    #plt.show()
+
 # -----------------------------
 # Digital RNN Model
 # -----------------------------
@@ -256,6 +378,264 @@ class FullyNonlinearKANRNN(nn.Module):
         return self.kan_classifier(h)
 
 
+import os
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+
+def ferro_params(layer, i_idx, o_idx, b_idx):
+    """
+    Works for BOTH BatchedFerroelectricBasis and FerroelectricBasis as you defined them:
+      k, Ec, Ps, coef all have shape (in_dim, out_dim, num_basis)
+    """
+    w  = float(layer.coef[i_idx, o_idx, b_idx].detach().cpu())
+    Ps = float(layer.Ps [i_idx, o_idx, b_idx].detach().cpu())
+    Ec = float(layer.Ec [i_idx, o_idx, b_idx].detach().cpu())
+    k  = float(layer.k  [i_idx, o_idx, b_idx].detach().cpu())
+    return w, Ps, Ec, k
+
+
+def visualize_noisy_ferro_layer(
+    layer,
+    layer_name="layer",
+    field_range=(-5, 5),
+    n_points=200,
+    max_basis=5,
+    which_in_out=(0, 0),
+    noise_std=0.2,     # override layer.noise_std if provided
+    seed=0,             # seed for deterministic noise
+):
+    """
+    Plot ONLY the noisy hysteresis curves for a single layer (use_noise=True).
+
+    Works for BOTH:
+      - BatchedFerroelectricBasis
+      - FerroelectricBasis
+
+    Assumes:
+      - layer.forward(x, return_activations=True) returns (_, basis, _)
+      - basis shape: (B, in_dim, out_dim, num_basis)
+      - layer has .use_noise and .noise_std
+    """
+    device = next(layer.parameters()).device
+
+    i_idx, o_idx = which_in_out
+    i_idx = int(np.clip(i_idx, 0, layer.in_dim - 1))
+    o_idx = int(np.clip(o_idx, 0, layer.out_dim - 1))
+
+    nb = min(max_basis, layer.num_basis)
+
+    E_up = torch.linspace(field_range[0], field_range[1], n_points, device=device)
+    E_dn = torch.linspace(field_range[1], field_range[0], n_points, device=device)
+
+    n_cols = min(2, nb)
+    n_rows = (nb + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 5 * n_rows))
+    if nb == 1:
+        axes = np.array([axes])
+    axes = axes.flatten()
+
+    # Save and force noisy mode
+    old_use = getattr(layer, "use_noise", False)
+    old_std = getattr(layer, "noise_std", None)
+
+    if hasattr(layer, "use_noise"):
+        layer.use_noise = True
+    if noise_std is not None and hasattr(layer, "noise_std"):
+        layer.noise_std = float(noise_std)
+
+    # Deterministic noise for visualization
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    # Reset once for proper up->down hysteresis sweep
+    if hasattr(layer, "reset_state"):
+        layer.reset_state()
+
+    def _make_input(e_scalar):
+        return torch.full((1, layer.in_dim), float(e_scalar), dtype=torch.float32, device=device)
+
+    # Precompute all basis curves (so titles can be set cleanly)
+    P_up = [[] for _ in range(nb)]
+    P_dn = [[] for _ in range(nb)]
+
+    # Up sweep
+    for e in E_up:
+        x_in = _make_input(e.item())
+        with torch.no_grad():
+            _, basis, _ = layer(x_in, return_activations=True)
+        for b in range(nb):
+            P_up[b].append(basis[0, i_idx, o_idx, b].item())
+
+    # Down sweep
+    for e in E_dn:
+        x_in = _make_input(e.item())
+        with torch.no_grad():
+            _, basis, _ = layer(x_in, return_activations=True)
+        for b in range(nb):
+            P_dn[b].append(basis[0, i_idx, o_idx, b].item())
+
+    x_up = E_up.detach().cpu().numpy()
+    x_dn = E_dn.detach().cpu().numpy()
+
+    for b_idx in range(nb):
+        ax = axes[b_idx]
+        w, Ps, Ec, k = ferro_params(layer, i_idx, o_idx, b_idx)
+
+        ax.plot(x_up, np.array(P_up[b_idx]), linewidth=2, label=f"Noisy up (std={layer.noise_std:.3f})")
+        ax.plot(x_dn, np.array(P_dn[b_idx]), linewidth=2, label="Noisy down")
+
+        ax.set_xlabel("Electric Field (E)")
+        ax.set_ylabel("Polarization (P)")
+        ax.set_title(
+            f"{layer_name} | basis {b_idx}\n"
+            f"w={w:.3f}, Ps={Ps:.3f}, Ec={Ec:.3f}, k={k:.3f}",
+            fontsize=10
+        )
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+
+    # Hide unused
+    for j in range(nb, len(axes)):
+        axes[j].set_visible(False)
+
+    # Restore
+    if hasattr(layer, "use_noise"):
+        layer.use_noise = old_use
+    if hasattr(layer, "noise_std"):
+        layer.noise_std = old_std
+
+    fig.suptitle(f"Noisy Hysteresis: {layer_name}", fontsize=15)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    #plt.show()
+
+
+def visualize_FEPA_RNN_hysteresis_noisy(
+    model,
+    epoch,
+    field_range=(-5, 5),
+    n_points=200,
+    max_basis=5,
+    which_in_out=(0, 0),
+    share_x=True,
+    noise_std=0.2,   # override model layer noise_std if provided
+    seed=0,           # deterministic noise for visualization
+    save_dir="Noisy_FEPA_RNN_Hysteresis",
+):
+    """
+    Visualize NOISY hysteresis loops for ALL ferroelectric bases in the KanFEPA_RNN model:
+      1) model.rnn_cell.input_basis
+      2) model.rnn_cell.hidden_basis
+      3) model.kan_classifier.basis
+
+    This version forces use_noise=True while plotting.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+
+    bases = [
+        ("rnn_cell.input_basis",   model.rnn_cell.input_basis),
+        ("rnn_cell.hidden_basis",  model.rnn_cell.hidden_basis),
+        ("kan_classifier.basis",   model.kan_classifier.basis),
+    ]
+
+    # Field sweeps
+    E_up = torch.linspace(field_range[0], field_range[1], n_points, device=device)
+    E_dn = torch.linspace(field_range[1], field_range[0], n_points, device=device)
+
+    in_dim_idx, out_dim_idx = which_in_out
+
+    # One clean grid for all rows
+    num_basis_to_show = min(max_basis, min(layer.num_basis for _, layer in bases))
+    n_rows, n_cols = len(bases), num_basis_to_show
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(6.5 * n_cols, 4.8 * n_rows),
+        sharex=share_x
+    )
+    if n_cols == 1:
+        axes = np.array(axes).reshape(n_rows, 1)
+
+    # Deterministic noise for visualization
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    def _make_input(layer, e_scalar):
+        return torch.full((1, layer.in_dim), float(e_scalar), dtype=torch.float32, device=device)
+
+    for row, (name, layer) in enumerate(bases):
+        i_idx = int(np.clip(in_dim_idx, 0, layer.in_dim - 1))
+        o_idx = int(np.clip(out_dim_idx, 0, layer.out_dim - 1))
+
+        # Save and force noisy mode for this layer
+        old_use = getattr(layer, "use_noise", False)
+        old_std = getattr(layer, "noise_std", None)
+
+        if hasattr(layer, "use_noise"):
+            layer.use_noise = True
+        if noise_std is not None and hasattr(layer, "noise_std"):
+            layer.noise_std = float(noise_std)
+
+        # Reset once per layer so up->down shows hysteresis
+        if hasattr(layer, "reset_state"):
+            layer.reset_state()
+
+        for b_idx in range(num_basis_to_show):
+            ax = axes[row, b_idx]
+            P_up, P_dn = [], []
+
+            # Up sweep
+            for e in E_up:
+                x_in = _make_input(layer, e.item())
+                with torch.no_grad():
+                    _, basis, _ = layer(x_in, return_activations=True)
+                P_up.append(basis[0, i_idx, o_idx, b_idx].item())
+
+            # Down sweep
+            for e in E_dn:
+                x_in = _make_input(layer, e.item())
+                with torch.no_grad():
+                    _, basis, _ = layer(x_in, return_activations=True)
+                P_dn.append(basis[0, i_idx, o_idx, b_idx].item())
+
+            w, Ps, Ec, k = ferro_params(layer, i_idx, o_idx, b_idx)
+
+            ax.plot(E_up.detach().cpu().numpy(), np.array(P_up), 'b-', linewidth=2,
+                    label=f"Noisy up (std={layer.noise_std:.3f})")
+            ax.plot(E_dn.detach().cpu().numpy(), np.array(P_dn), 'r-', linewidth=2, label="Noisy down")
+
+            ax.set_title(
+                f"{name}\nBasis b={b_idx} | w={w:.3f}, Ps={Ps:.3f}, Ec={Ec:.3f}, k={k:.3f}",
+                fontsize=10
+            )
+            ax.set_xlabel("Electric Field (E)")
+            ax.set_ylabel("Polarization (P)")
+            ax.grid(True, alpha=0.3)
+            if b_idx == 0:
+                ax.legend(fontsize=9)
+
+        # Restore layer noise settings
+        if hasattr(layer, "use_noise"):
+            layer.use_noise = old_use
+        if hasattr(layer, "noise_std"):
+            layer.noise_std = old_std
+
+    fig.suptitle(
+        f"20% Noise Added: KanFEPA-RNN Ferroelectric Hysteresis Loops",
+        fontsize=15
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir, f"KanFEPA_RNN_hysteresis_noisy_epoch{epoch}.png")
+    plt.savefig(out_path, dpi=200)
+    #plt.show()
+
+    return out_path
+
 
 def visualize_FEPA_RNN_hysteresis(
     model,
@@ -389,6 +769,22 @@ def train_KAN_RNN(
     test_loader = DataLoader(test_set, batch_size=4)
 
     model = FullyNonlinearKANRNN()
+    '''
+    visualize_clean_vs_noisy_ferro_layer(
+    model.rnn_cell.input_basis,
+    layer_name="rnn_cell.input_basis",
+    noise_std=0.2,
+    seed=0
+    )
+
+    visualize_clean_vs_noisy_ferro_layer(
+        model.rnn_cell.hidden_basis,
+        layer_name="rnn_cell.hidden_basis",
+        noise_std=0.2,
+        seed=0
+    )
+    '''
+
     print(f"Trainable parameters: {count_trainable_params(model),}")
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-5)
@@ -428,7 +824,8 @@ def train_KAN_RNN(
         test_acc_list.append(acc_test)
 
         if ep % 10 == 0 or ep == 1:
-            visualize_FEPA_RNN_hysteresis(
+            #remove the _noisy in function sig to visualize the clean version
+            visualize_FEPA_RNN_hysteresis_noisy(
                 model,
                 ep, 
                 field_range=(-5, 5),
@@ -836,6 +1233,218 @@ def visualize_all_ferroelectric_bases_NODE_RNN(
     #plt.show()
 
 
+import os
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+
+def ferro_params(layer, i_idx, o_idx, b_idx):
+    # Works for BOTH BatchedFerroelectricBasis and FerroelectricBasis as you defined them
+    w  = float(layer.coef[i_idx, o_idx, b_idx].detach().cpu())
+    Ps = float(layer.Ps [i_idx, o_idx, b_idx].detach().cpu())
+    Ec = float(layer.Ec [i_idx, o_idx, b_idx].detach().cpu())
+    k  = float(layer.k  [i_idx, o_idx, b_idx].detach().cpu())
+    return w, Ps, Ec, k
+
+
+def visualize_all_ferroelectric_bases_NODE_RNN_noisy(
+    model,
+    epoch,
+    field_range=(-5, 5),
+    n_points=200,
+    max_basis=5,
+    which_in_out=(0, 0),
+    style="grid",
+    share_x=True,
+    noise_std=0.2,   # override per-layer noise_std for visualization
+    seed=0,           # deterministic noise
+    save_dir="Noisy_KanFEPA_RNN_NODE_Hysteresis",
+):
+    """
+    NOISY version of visualize_all_ferroelectric_bases_NODE_RNN.
+
+    Forces use_noise=True for each FerroelectricBasis / BatchedFerroelectricBasis layer while plotting.
+    Also fixes coefficient indexing: w is read from layer.coef[i,o,b] (not from returned `coef`).
+
+    Layers visualized:
+      A) model.enc.odefunc.basis
+      B) model.rnn_cell.input_basis
+      C) model.rnn_cell.hidden_basis
+
+    If a layer doesn't support return_activations=True, we fall back to plotting "effective output"
+    (phi[:, o_idx]) vs E, but we can only show w/Ps/Ec/k if the layer has those Parameters.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+
+    bases = [
+        ("enc.odefunc.basis",        model.enc.odefunc.basis),
+        ("rnn_cell.input_basis",     model.rnn_cell.input_basis),
+        ("rnn_cell.hidden_basis",    model.rnn_cell.hidden_basis),
+    ]
+
+    # deterministic noise for visualization
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    E_up = torch.linspace(field_range[0], field_range[1], n_points, device=device)
+    E_dn = torch.linspace(field_range[1], field_range[0], n_points, device=device)
+    in_dim_idx, out_dim_idx = which_in_out
+
+    def _num_basis(layer):
+        return getattr(layer, "num_basis", None)
+
+    nb_list = [(_num_basis(layer) or 1) for _, layer in bases]
+    num_basis_to_show = min(max_basis, min(nb_list))
+
+    n_rows = len(bases)
+    n_cols = num_basis_to_show if style == "grid" else 1
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(6.5 * n_cols, 4.8 * n_rows),
+        sharex=share_x
+    )
+    if n_rows == 1 and n_cols == 1:
+        axes = np.array([[axes]])
+    elif n_rows == 1:
+        axes = np.array([axes])
+    elif n_cols == 1:
+        axes = np.array(axes).reshape(n_rows, 1)
+
+    def _reset(layer):
+        if hasattr(layer, "reset_state"):
+            layer.reset_state()
+
+    def _make_input(layer, e_scalar):
+        in_dim = getattr(layer, "in_dim", 1)
+        return torch.full((1, in_dim), float(e_scalar), dtype=torch.float32, device=device)
+
+    def _call_with_activations(layer, x_in):
+        """
+        Return (mode, basis, phi):
+          - mode=="basis": basis is (B,in_dim,out_dim,num_basis)
+          - mode=="phi"  : phi is (B,out_dim) or (B,*) and basis is None
+        """
+        try:
+            out = layer(x_in, return_activations=True)
+            if isinstance(out, (tuple, list)) and len(out) >= 2:
+                # (output, basis, coef) OR (phi, basis, coef)
+                phi = out[0]
+                basis = out[1] if len(out) > 1 else None
+                if torch.is_tensor(basis) and basis.dim() == 4:
+                    return "basis", basis, phi
+                return "phi", None, phi
+            if torch.is_tensor(out):
+                return "phi", None, out
+            return "phi", None, out[0] if isinstance(out, (tuple, list)) else None
+        except TypeError:
+            phi = layer(x_in)
+            return "phi", None, phi
+
+    # ---- Main plotting loop ----
+    for row, (name, layer) in enumerate(bases):
+        # clamp indices
+        layer_in = getattr(layer, "in_dim", 1)
+        layer_out = getattr(layer, "out_dim", getattr(layer, "hidden_size", 1))
+        i_idx = int(np.clip(in_dim_idx, 0, layer_in - 1))
+        o_idx = int(np.clip(out_dim_idx, 0, layer_out - 1))
+
+        # Force noisy mode for this layer
+        old_use = getattr(layer, "use_noise", False)
+        old_std = getattr(layer, "noise_std", None)
+
+        if hasattr(layer, "use_noise"):
+            layer.use_noise = True
+        if noise_std is not None and hasattr(layer, "noise_std"):
+            layer.noise_std = float(noise_std)
+
+        _reset(layer)
+
+        layer_nb = getattr(layer, "num_basis", None)
+        plot_cols = num_basis_to_show if (style == "grid" and layer_nb is not None) else 1
+
+        for col in range(plot_cols):
+            b_idx = col
+            ax = axes[row, col] if style == "grid" else axes[row, 0]
+
+            P_up, P_dn = [], []
+
+            # Up sweep
+            for e in E_up:
+                x_in = _make_input(layer, e.item())
+                with torch.no_grad():
+                    mode, basis, phi = _call_with_activations(layer, x_in)
+                if mode == "basis":
+                    P_up.append(basis[0, i_idx, o_idx, b_idx].item())
+                else:
+                    # effective output
+                    if phi is not None and phi.dim() == 2 and phi.size(1) > o_idx:
+                        P_up.append(phi[0, o_idx].item())
+                    else:
+                        P_up.append(float(phi.reshape(-1)[0].item()) if phi is not None else 0.0)
+
+            # Down sweep
+            for e in E_dn:
+                x_in = _make_input(layer, e.item())
+                with torch.no_grad():
+                    mode, basis, phi = _call_with_activations(layer, x_in)
+                if mode == "basis":
+                    P_dn.append(basis[0, i_idx, o_idx, b_idx].item())
+                else:
+                    if phi is not None and phi.dim() == 2 and phi.size(1) > o_idx:
+                        P_dn.append(phi[0, o_idx].item())
+                    else:
+                        P_dn.append(float(phi.reshape(-1)[0].item()) if phi is not None else 0.0)
+
+            ax.plot(E_up.detach().cpu().numpy(), np.array(P_up), 'b-', linewidth=2,
+                    label=f"Noisy up (std={getattr(layer, 'noise_std', 0.0):.3f})")
+            ax.plot(E_dn.detach().cpu().numpy(), np.array(P_dn), 'r-', linewidth=2, label="Noisy down")
+
+            # Title text
+            if layer_nb is None or plot_cols == 1 and layer_nb is None:
+                ax.set_title(f"{name} (effective output)", fontsize=10)
+            else:
+                # show physical params if available
+                if all(hasattr(layer, attr) for attr in ("coef", "Ps", "Ec", "k")):
+                    w, Ps, Ec, k = ferro_params(layer, i_idx, o_idx, b_idx)
+                    ax.set_title(
+                        f"{name}\nBasis b={b_idx} | w={w:.3f}, Ps={Ps:.3f}, Ec={Ec:.3f}, k={k:.3f}",
+                        fontsize=10
+                    )
+                else:
+                    ax.set_title(f"{name}\nBasis b={b_idx}", fontsize=10)
+
+            ax.set_xlabel("Electric Field (E)")
+            ax.set_ylabel("Polarization / Response")
+            ax.grid(True, alpha=0.3)
+            if col == 0:
+                ax.legend(fontsize=9)
+
+        # hide unused columns if needed
+        if style == "grid" and layer_nb is None:
+            for col in range(1, n_cols):
+                axes[row, col].set_visible(False)
+
+        # restore noise settings for this layer
+        if hasattr(layer, "use_noise"):
+            layer.use_noise = old_use
+        if hasattr(layer, "noise_std"):
+            layer.noise_std = old_std
+
+    fig.suptitle(
+        f"20% Noise Added:KanFEPA-RNN-NODE NOISY Ferroelectric Hysteresis Loops",
+        fontsize=15
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir, f"kanFEPA_RNN_NODE_noisy_epoch{epoch}.png")
+    plt.savefig(out_path, dpi=200)
+    #plt.show()
+
+    return out_path
 
 # ----------------------------
 # Training loop adapted for RNN-NODE
@@ -923,6 +1532,7 @@ def train_rnn_node(
         test_acc_list.append(acc_test)
 
         if ep % 10 == 0 or ep == 1:
+            '''
             visualize_all_ferroelectric_bases_NODE_RNN(
                 model,
                 ep, 
@@ -932,6 +1542,11 @@ def train_rnn_node(
                 which_in_out=(0, 0),
                 style="grid",
             )
+            '''
+            _ = visualize_all_ferroelectric_bases_NODE_RNN_noisy(
+                model, epoch=ep, noise_std=0.2, seed=0
+            )
+
             print(
                 f"Epoch {ep:3d} | "
                 f"train_loss {train_loss:.6f} | "
@@ -1184,6 +1799,208 @@ def visualize_all_ferro_bases_KanFEPA_MLP_NODE(
     plt.savefig(f"KanFEPA_MLP_NODE_Hysteresis/kanFEPA-MLP-NODE_hysteresis_epoch{epoch}.png")
     #plt.show()
 
+
+import os
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+
+def ferro_params(layer, i_idx, o_idx, b_idx):
+    # Works for BOTH FerroelectricBasis and BatchedFerroelectricBasis you showed
+    w  = float(layer.coef[i_idx, o_idx, b_idx].detach().cpu())
+    Ps = float(layer.Ps [i_idx, o_idx, b_idx].detach().cpu())
+    Ec = float(layer.Ec [i_idx, o_idx, b_idx].detach().cpu())
+    k  = float(layer.k  [i_idx, o_idx, b_idx].detach().cpu())
+    return w, Ps, Ec, k
+
+
+def visualize_all_ferro_bases_KanFEPA_MLP_NODE_noisy(
+    model,
+    epoch,
+    field_range=(-5, 5),
+    n_points=200,
+    max_basis=6,
+    which_in_out=(0, 0),
+    mode="auto",          # "auto" | "basis" | "output"
+    share_x=True,
+    noise_std=0.2,       # override layer.noise_std if provided
+    seed=0,               # deterministic noise for visualization
+    save_dir="Noisy_KanFEPA_MLP_NODE_Hysteresis",
+):
+    model.eval()
+    device = next(model.parameters()).device
+
+    layers = [
+        ("odefunc.fc1", model.odefunc.fc1),
+        ("odefunc.fc2", model.odefunc.fc2),
+    ]
+
+    # deterministic noise
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    E_up = torch.linspace(field_range[0], field_range[1], n_points, device=device)
+    E_dn = torch.linspace(field_range[1], field_range[0], n_points, device=device)
+
+    in_dim_idx, out_dim_idx = which_in_out
+
+    def _reset(layer):
+        if hasattr(layer, "reset_state"):
+            layer.reset_state()
+
+    def _make_input(layer, e_scalar):
+        in_dim = getattr(layer, "in_dim", 1)
+        return torch.full((1, in_dim), float(e_scalar), dtype=torch.float32, device=device)
+
+    def _try_call(layer, x_in):
+        """
+        Returns (kind, phi, basis)
+          kind: "basis" if we got per-basis tensor; otherwise "output"
+        """
+        if mode == "output":
+            phi = layer(x_in)
+            return "output", phi, None
+
+        if mode in ("auto", "basis"):
+            try:
+                out = layer(x_in, return_activations=True)
+                if isinstance(out, (tuple, list)) and len(out) >= 3:
+                    phi, basis = out[0], out[1]
+                    if torch.is_tensor(basis) and basis.dim() == 4:
+                        return "basis", phi, basis
+            except TypeError:
+                if mode == "basis":
+                    raise
+
+        phi = layer(x_in)
+        return "output", phi, None
+
+    # layout choice
+    nb_list = [getattr(l, "num_basis", None) for _, l in layers]
+    have_basis = all(nb is not None for nb in nb_list)
+
+    if mode == "basis" and not have_basis:
+        raise RuntimeError("mode='basis' requested but some layers do not expose num_basis / basis tensor.")
+
+    if have_basis and mode != "output":
+        num_basis_to_show = min(max_basis, min(int(nb) for nb in nb_list))
+        n_cols = num_basis_to_show
+    else:
+        num_basis_to_show = 1
+        n_cols = 1
+
+    n_rows = len(layers)
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(6.5 * n_cols, 4.8 * n_rows),
+        sharex=share_x
+    )
+    if n_rows == 1 and n_cols == 1:
+        axes = np.array([[axes]])
+    elif n_rows == 1:
+        axes = np.array([axes])
+    elif n_cols == 1:
+        axes = np.array(axes).reshape(n_rows, 1)
+
+    for r, (name, layer) in enumerate(layers):
+        # ---- force noisy mode for this layer (and restore after) ----
+        old_use = getattr(layer, "use_noise", False)
+        old_std = getattr(layer, "noise_std", None)
+
+        if hasattr(layer, "use_noise"):
+            layer.use_noise = True
+        if noise_std is not None and hasattr(layer, "noise_std"):
+            layer.noise_std = float(noise_std)
+
+        _reset(layer)
+
+        layer_in = getattr(layer, "in_dim", 1)
+        layer_out = getattr(layer, "out_dim", 1)
+        i_idx = int(np.clip(in_dim_idx, 0, layer_in - 1))
+        o_idx = int(np.clip(out_dim_idx, 0, layer_out - 1))
+
+        kind_used = None
+
+        for c in range(n_cols):
+            b_idx = c
+            ax = axes[r, c]
+
+            P_up, P_dn = [], []
+
+            # up sweep
+            for e in E_up:
+                x_in = _make_input(layer, e.item())
+                with torch.no_grad():
+                    kind, phi, basis = _try_call(layer, x_in)
+                kind_used = kind
+                if kind == "basis":
+                    P_up.append(basis[0, i_idx, o_idx, b_idx].item())
+                else:
+                    if phi.dim() == 2 and phi.size(1) > o_idx:
+                        P_up.append(phi[0, o_idx].item())
+                    else:
+                        P_up.append(phi.reshape(-1)[0].item())
+
+            # down sweep
+            for e in E_dn:
+                x_in = _make_input(layer, e.item())
+                with torch.no_grad():
+                    kind, phi, basis = _try_call(layer, x_in)
+                if kind == "basis":
+                    P_dn.append(basis[0, i_idx, o_idx, b_idx].item())
+                else:
+                    if phi.dim() == 2 and phi.size(1) > o_idx:
+                        P_dn.append(phi[0, o_idx].item())
+                    else:
+                        P_dn.append(phi.reshape(-1)[0].item())
+
+            ax.plot(E_up.detach().cpu().numpy(), np.array(P_up), 'b-', linewidth=2,
+                    label=f"Noisy up (std={getattr(layer, 'noise_std', 0.0):.3f})")
+            ax.plot(E_dn.detach().cpu().numpy(), np.array(P_dn), 'r-', linewidth=2, label="Noisy down")
+            ax.grid(True, alpha=0.3)
+            ax.set_xlabel("Electric Field (E)")
+            ax.set_ylabel("Polarization / Response")
+
+            if kind_used == "basis":
+                w, Ps, Ec, k = ferro_params(layer, i_idx, o_idx, b_idx)
+                ax.set_title(
+                    f"{name}\nBasis b={b_idx} | w={w:.3f}, Ps={Ps:.3f}, Ec={Ec:.3f}, k={k:.3f}",
+                    fontsize=10
+                )
+            else:
+                ax.set_title(f"{name} (effective output)", fontsize=11)
+
+            if c == 0:
+                ax.legend(fontsize=9)
+
+        # Hide extra columns if we fell back to output mode for this layer
+        if n_cols > 1 and kind_used != "basis":
+            for c in range(1, n_cols):
+                axes[r, c].set_visible(False)
+
+        # restore layer settings
+        if hasattr(layer, "use_noise"):
+            layer.use_noise = old_use
+        if hasattr(layer, "noise_std"):
+            layer.noise_std = old_std
+
+    fig.suptitle(
+        f"20% Noise Added: KanFEPA-MLP-NODE Ferroelectric Hysteresis Loops",
+        fontsize=15
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir, f"kanFEPA-MLP-NODE_hysteresis_noisy_epoch{epoch}.png")
+    plt.savefig(out_path, dpi=200)
+    #plt.show()
+
+    return out_path
+
+
+
+
 def train_kan_fet_mlp_node(
     train_path="data/ECG200_TRAIN.txt",
     test_path="data/ECG200_TEST.txt",
@@ -1269,6 +2086,7 @@ def train_kan_fet_mlp_node(
         test_acc_list.append(acc_test)
         acc = eval_acc(model, test_loader, "cpu")
         if ep % 10 == 0 or ep == 1:
+            '''
             visualize_all_ferro_bases_KanFEPA_MLP_NODE(
                 model,
                 ep,
@@ -1277,6 +2095,11 @@ def train_kan_fet_mlp_node(
                 max_basis=6,
                 which_in_out=(0, 0),
                 mode="auto",   # try per-basis if available; otherwise effective output
+            )
+            '''
+
+            _ = visualize_all_ferro_bases_KanFEPA_MLP_NODE_noisy(
+                model, epoch=ep, noise_std=0.2, seed=0, max_basis=6
             )
             print(
                 f"Epoch {ep:3d} | "
@@ -1326,6 +2149,7 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-4,
     )
+
 
     print("Training KanFEPA-RNN...")
     base_rnn_model, base_rnn_train_acc, base_rnn_test_acc = train_KAN_RNN(epochs=EPOCHS)
