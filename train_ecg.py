@@ -60,11 +60,11 @@ def count_trainable_params(m):
 
 
 def ferro_params(layer, i_idx, o_idx, b_idx):
-    w  = float(layer.coef[i_idx, o_idx, b_idx].detach().cpu())
+    coef  = float(layer.coef[i_idx, o_idx, b_idx].detach().cpu())
     Ps = float(layer.Ps [i_idx, o_idx, b_idx].detach().cpu())
     Ec = float(layer.Ec [i_idx, o_idx, b_idx].detach().cpu())
     k  = float(layer.k  [i_idx, o_idx, b_idx].detach().cpu())
-    return w, Ps, Ec, k
+    return coef, Ps, Ec, k
 # -----------------------------
 # Digital RNN Model
 # -----------------------------
@@ -352,7 +352,7 @@ def visualize_FEPA_RNN_hysteresis(
             ax.plot(E_dn.detach().cpu().numpy(), np.array(P_dn), 'r-', linewidth=2, label="Down")
 
             w, Ps, Ec, k = ferro_params(layer, i_idx, o_idx, b_idx)
-            ax.set_title(f"{name}\nBasis b={b_idx} | w={w:.3f}, Ps={Ps:.3f}, Ec={Ec:.3f}, k={k:.3f}", fontsize=10)
+            ax.set_title(f"{name}\nBasis b={b_idx} | coef[idx]={w:.3f}, Ps[idx]={Ps:.3f}, Ec[idx]={Ec:.3f}, k[idx]={k:.3f} | idx=[0, 0, {b_idx}]", fontsize=10)
             ax.set_xlabel("Electric Field (E)")
             ax.set_ylabel("Polarization (P)")
             ax.grid(True, alpha=0.3)
@@ -447,7 +447,88 @@ def train_KAN_RNN(
 
 #-----------------------RNN-NODE-----------------------------
 
+class LinearInterp1D:
+    def __init__(self, t_grid, x_grid):
+        self.t = t_grid
+        self.x = x_grid
+        self.T = t_grid.numel()
 
+    def __call__(self, t_query):
+        t = torch.clamp(t_query, self.t[0], self.t[-1])
+        i = torch.searchsorted(self.t, t).clamp(1, self.T - 1)
+        t0, t1 = self.t[i - 1], self.t[i]
+        x0, x1 = self.x[i - 1], self.x[i]
+        w = (t - t0) / (t1 - t0 + 1e-12)
+        return (1.0 - w) * x0 + w * x1  # (D,)
+
+class KANRNNinODEFunc(nn.Module):
+    """
+    dh/dt = alpha * (cell(z(t), h) - h)
+    where cell is a discrete-time RNN cell (FullyNonlinearKANCell).
+    """
+    def __init__(self, input_size, hidden_size, num_basis, alpha=10.0):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.alpha = alpha
+
+        # Input lift (z = lift(x(t))) so the cell sees hidden_size input
+        self.lift = nn.Linear(input_size, hidden_size)
+
+        # Your nonlinear KAN RNN cell: expects (x_t, h) -> h_next
+        self.cell = FullyNonlinearKANCell(hidden_size, hidden_size, num_basis)
+
+        self._interp = None
+
+    def set_interpolator(self, interp_callable):
+        self._interp = interp_callable
+
+    def forward(self, t, h):
+        # h: (1, H)
+        assert self._interp is not None
+        x_t = self._interp(t).unsqueeze(0)      # (1, D)
+        z_t = self.lift(x_t)                    # (1, H)
+
+        h_next = self.cell(z_t, h)              # (1, H) discrete update
+        dh = self.alpha * (h_next - h)         
+        return dh
+
+class ODEIntegratedRNNEncoder(nn.Module):
+    """
+    Runs an ODE whose RHS uses an RNN cell.
+    Returns either final state or full trajectory.
+    """
+    def __init__(self, input_size, hidden_size, num_basis,
+                 solver="rk4", rtol=1e-3, atol=1e-4, alpha=10.0):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.solver = solver
+        self.rtol = rtol
+        self.atol = atol
+        self.odefunc = KANRNNinODEFunc(input_size, hidden_size, num_basis, alpha=alpha)
+
+        # Initial hidden state from x0 (helps vs starting at zeros)
+        self.h0_lift = nn.Linear(input_size, hidden_size)
+
+    def forward(self, xb, return_traj=False):
+        """
+        xb: (1, T, D) per-sample
+        """
+        assert xb.dim() == 3 and xb.size(0) == 1
+        T = xb.size(1)
+        D = xb.size(2)
+
+        t_grid = torch.linspace(0.0, 1.0, steps=T, device=xb.device, dtype=xb.dtype)  # (T,)
+        x_grid = xb[0]  # (T, D)
+        interp = LinearInterp1D(t_grid, x_grid)
+        self.odefunc.set_interpolator(interp)
+
+        h0 = self.h0_lift(x_grid[0:1])  # (1, H)
+
+        h_traj = odeint(self.odefunc, h0, t_grid,
+                        method=self.solver, rtol=self.rtol, atol=self.atol)  # (T, 1, H)
+         
+        return h_traj[-1] 
+'''
 class LinearInterp1D:
     """
     Cheap batched linear interpolation for x(t) along a fixed time grid.
@@ -457,9 +538,9 @@ class LinearInterp1D:
     Returns x(t): (1, D) for scalar t
     """
     def __init__(self, t_grid, x_grid):
-        self.t = t_grid
-        self.x = x_grid
-        self.T = t_grid.numel()
+        self.t = t_grid #time_grid: linspace
+        self.x = x_grid #[96, 1]
+        self.T = t_grid.numel() #int
 
     def __call__(self, t_query):
         # clamp to grid range
@@ -587,47 +668,6 @@ class NODE_RNN(nn.Module):
 
         feats = torch.cat(feats, dim=0)   # (B, H)
         return self.head(feats)
-'''
-class NODE_RNN(nn.Module):
-    """
-    Full model: one ODE encoder + head.
-    """
-    def __init__(self, input_size=1, hidden_size=64, num_classes=2, num_basis=10,
-                 solver="rk4", rtol=1e-3, atol=1e-4, dropout=0.1):
-        super().__init__()
-        self.enc = OneODEEncoder(input_size, hidden_size, num_basis, solver=solver, rtol=rtol, atol=atol)
-        #self.dropout = nn.Dropout(dropout)
-        self.rnn_cell = FullyNonlinearKANCell(hidden_size, hidden_size, num_basis)
-        self.head = nn.Linear(hidden_size, num_classes) #digital classifier
-
-    def forward(self, x):
-        # x: (B,T) or (B,T,D)
-        if x.dim() == 2:
-            x = x.unsqueeze(-1)
-        B, T, D = x.shape
-
-        feats = []
-        for b in range(B):
-            xb = x[b:b+1]                 # (1, T, D)
-
-            # IMPORTANT: call encoder once
-            z_seq = self.enc(xb)          # expected (1, T, H)
-
-            # make sure z_seq is (T, H) for indexing by time
-            if z_seq.dim() == 3:
-                z_seq = z_seq[0]          # (T, H)
-            elif z_seq.dim() != 2:
-                raise RuntimeError(f"Unexpected z_seq shape: {tuple(z_seq.shape)}")
-
-            h = torch.zeros(1, self.enc.hidden_size, device=x.device, dtype=x.dtype)  # (1, H)
-
-            for t in range(z_seq.size(0)):
-                z_t = z_seq[t:t+1]        # (1, H)  <-- safest slice (never becomes 1D)
-                h = self.rnn_cell(z_t, h)
-            feats.append(h)   # (B, C)
-        feats = torch.cat(feats, dim=0)   # (B, H)
-        logits = self.head(feats)         # (B, C)
-        return logits
 '''
 
 def visualize_all_ferroelectric_bases_NODE_RNN(
@@ -812,7 +852,7 @@ def visualize_all_ferroelectric_bases_NODE_RNN(
             else:
                 ax.set_title(f"{name} | basis {b_idx}{weight_str}", fontsize=10)
                 w, Ps, Ec, k = ferro_params(layer, i_idx, o_idx, b_idx)
-                ax.set_title(f"{name}\nBasis b={b_idx} | w={w:.3f}, Ps={Ps:.3f}, Ec={Ec:.3f}, k={k:.3f}", fontsize=10)
+                ax.set_title(f"{name}\nBasis b={b_idx} | coef[idx]={w:.3f}, Ps[idx]={Ps:.3f}, Ec[idx]={Ec:.3f}, k[idx]={k:.3f} | idx=[0, 0, {b_idx}]", fontsize=10)
 
             ax.set_xlabel("Electric Field (E)")
             ax.set_ylabel("Polarization / Response")
@@ -1162,7 +1202,7 @@ def visualize_all_ferro_bases_KanFEPA_MLP_NODE(
 
             if kind_used == "basis":
                 w, Ps, Ec, k = ferro_params(layer, i_idx, o_idx, b_idx)
-                ax.set_title(f"{name}\nBasis b={b_idx} | w={w:.3f}, Ps={Ps:.3f}, Ec={Ec:.3f}, k={k:.3f}", fontsize=10)
+                ax.set_title(f"{name}\nBasis b={b_idx} | coef[idx]={w:.3f}, Ps[idx]={Ps:.3f}, Ec[idx]={Ec:.3f}, k[idx]={k:.3f} | idx=[0, 0, {b_idx}]", fontsize=10)
             else:
                 ax.set_title(f"{name} (effective output)", fontsize=11)
 
